@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -93,6 +94,43 @@ class CoordinatorTests(unittest.TestCase):
                 self.assertEqual(c.deliver(SID), 2)
             self.assertFalse(any(call.args and call.args[0] == 'send-keys' for call in tmux.call_args_list))
         self.assertEqual(c.read_json(c.session_dir(SID) / 'request.json')['state'], 'failed')
+
+
+    def test_delivery_targets_exact_bound_pane(self):
+        self.start()
+        c.atomic_json(c.session_dir(SID) / 'request.json',
+                      {'state':'stop_seen', 'handoff':'/tmp/handoff'})
+        calls = []
+        def fake_tmux(*args):
+            calls.append(args)
+            if args[0] == 'capture-pane':
+                return 'response\n❯\u00a0\n────────────────\n  ⏵ auto mode on'
+            return ''
+        with patch.object(c, 'tmux', side_effect=fake_tmux), patch.object(c.time, 'sleep'):
+            self.assertEqual(c.deliver(SID), 0)
+        sends = [call for call in calls if call[0] == 'send-keys']
+        self.assertEqual(sends[0], ('send-keys', '-t', '%12', '-l',
+                                     '/compact Preserve the durable handoff at /tmp/handoff'))
+        self.assertEqual(sends[1], ('send-keys', '-t', '%12', 'Enter'))
+        self.assertEqual(c.read_json(c.session_dir(SID) / 'request.json')['state'], 'sent')
+
+    def test_expired_request_does_not_launch_worker(self):
+        self.start()
+        c.atomic_json(c.session_dir(SID) / 'request.json',
+                      {'state':'queued', 'created':time.time()-10000})
+        with patch.object(c.subprocess, 'Popen') as popen:
+            c.hook({'hook_event_name':'Stop', 'session_id':SID, 'background_tasks':[]})
+            popen.assert_not_called()
+        self.assertEqual(c.read_json(c.session_dir(SID) / 'request.json')['state'], 'expired')
+
+    def test_config_invalid_order_fails_closed(self):
+        Path(os.environ['ORCH_COMPACT_CONFIG']).write_text(
+            json.dumps({'softThresholdTokens':400000, 'preferredCompactionTokens':300000}))
+        with self.assertRaises(ValueError): c.config()
+
+    def test_independent_session_paths(self):
+        self.assertNotEqual(c.session_dir(SID), c.session_dir('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'))
+        with self.assertRaises(ValueError): c.session_dir('../other')
 
     def test_postcompact_confirms_without_summary_logging(self):
         self.start()
