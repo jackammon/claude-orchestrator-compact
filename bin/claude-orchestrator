@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+if ! command -v tmux >/dev/null 2>&1; then
+  echo 'tmux is required; install with brew install tmux' >&2
+  exit 2
+fi
+if ! command -v claude >/dev/null 2>&1; then
+  echo 'Claude Code CLI is required' >&2
+  exit 2
+fi
+if [ "$#" -ne 0 ]; then
+  echo 'Launch arguments are not supported by this wrapper; run claude directly inside tmux for custom flags.' >&2
+  exit 2
+fi
+script=$0
+while [ -L "$script" ]; do
+  link=$(readlink "$script")
+  case "$link" in
+    /*) script=$link ;;
+    *) script="$(dirname -- "$script")/$link" ;;
+  esac
+done
+plugin_dir=$(CDPATH= cd -- "$(dirname -- "$script")/.." && pwd)
+if [ -n "${TMUX:-}" ]; then
+  exec claude --plugin-dir "$plugin_dir"
+fi
+name="orchestrator-$(date +%Y%m%d-%H%M%S)-$$"
+exec tmux new-session -s "$name" -e "ORCH_COMPACT_PLUGIN_DIR=$plugin_dir" 'exec claude --plugin-dir "$ORCH_COMPACT_PLUGIN_DIR"'

@@ -1,0 +1,9 @@
+{
+  "enabled": true,
+  "reminderThresholdTokens": 600000,
+  "requireNoActiveSubagents": true,
+  "requireOwnerInputClear": true,
+  "preserveHandoff": true,
+  "resumeAfterCompaction": true,
+  "telemetryEnabled": true
+}
