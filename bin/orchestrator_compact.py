@@ -107,6 +107,41 @@ def main_only(payload: dict) -> bool:
     return not payload.get("agent_id") and not payload.get("agent_type") and isinstance(payload.get("session_id"), str)
 
 
+def orchestrator_guidance(sid: str, token: str, cfg: dict) -> str:
+    command = (f"python3 {Path(__file__).resolve()} request --session {sid} --token {token} "
+               "--handoff ABSOLUTE_PATH --reason SHORT_REASON --agents-reconciled --owner-input-clear")
+    return (
+        "Main orchestrator only. Compaction is your decision; thresholds are advisory, never a mandatory "
+        "token cutoff: "
+        f"below {cfg['softThresholdTokens']:,} input tokens, continue normally; at "
+        f"{cfg['softThresholdTokens']:,}, look for a natural phase checkpoint; at "
+        f"{cfg['preferredCompactionTokens']:,}, prefer the next safe checkpoint; at "
+        f"{cfg['escalationThresholdTokens']:,}, consider the earliest safe checkpoint. You may defer even "
+        "past that threshold until a good stopping place. Consider whether compaction would discard useful working "
+        "context, harm answer quality, or increase rather than reduce cost. "
+        "Before requesting, finish and reconcile all child work, ensure no owner feedback, review, or approval "
+        "is pending, and save a concise durable handoff in the project's existing planning location: current "
+        "phase and goal, completed and remaining work, agent findings, branch/PR/CI state, decisions, blockers, "
+        "and concrete next actions. Do not create a redundant large document. "
+        f"Signal by running `{command}` through Bash; do not print `/compact` yourself. "
+        "Use --agents-reconciled and --owner-input-clear only when those assertions are true. "
+        "For a deliberate checkpoint below the soft threshold, add --force. Then finish your turn. "
+        "The coordinator checks the empty background-task registry at main Stop, enters `/compact` in this "
+        "session's tmux pane, and resumes from the handoff after confirmation. Never request this from a subagent."
+    )
+
+
+def threshold_reminder(n: int, tier: str) -> str:
+    advice = {
+        "soft": "Look for the next natural phase checkpoint.",
+        "preferred": "Prefer compaction at the next safe phase checkpoint.",
+        "escalated": "Consider the earliest safe checkpoint; you may defer until a good stopping place.",
+    }[tier]
+    return (f"Main orchestrator context is approximately {n:,} input tokens ({tier}). "
+            f"{advice} Reconcile agents, clear pending owner decisions, and save a concise handoff before "
+            "signaling with the session-specific request command. You may defer to preserve useful context.")
+
+
 def active_agents(sid: str, event: str | None = None, agent_id: str | None = None) -> list[str]:
     """Track child lifecycle with a lock; an unmatched start fails closed."""
     d = session_dir(sid)
@@ -158,7 +193,8 @@ def usage_from_transcript(path: str) -> dict | None:
 
 
 def hook(payload: dict) -> dict | None:
-    if not config()["enabled"]:
+    cfg = config()
+    if not cfg["enabled"]:
         return None
     event = payload.get("hook_event_name")
     sid = payload.get("session_id")
@@ -188,7 +224,7 @@ def hook(payload: dict) -> dict | None:
                                            "cwd": payload.get("cwd"), "created": time.time()})
         log(sid, "session_start", pane=pane)
         return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext":
-                f"Main orchestrator only: at phase checkpoints, inspect context reminders. If compaction helps, save a durable handoff and call `python3 {Path(__file__).resolve()} request --session {sid} --token {token} --handoff ABSOLUTE_PATH --reason SHORT_REASON --agents-reconciled --owner-input-clear`. Assert owner-input-clear only when no owner answer or approval is pending. Never do this from a subagent. This coordinator requires an empty background task registry at Stop."}}
+                orchestrator_guidance(sid, token, cfg)}}
     binding = read_json(d / "binding.json")
     if not binding:
         return None
@@ -206,7 +242,6 @@ def hook(payload: dict) -> dict | None:
         usage = usage_from_transcript(payload.get("transcript_path", ""))
         if usage:
             n = usage["context_input_tokens"]
-            cfg = config()
             tier = "escalated" if n >= cfg["escalationThresholdTokens"] else "preferred" if n >= cfg["preferredCompactionTokens"] else "soft" if n >= cfg["softThresholdTokens"] else "normal"
             state = read_json(d / "usage.json", {})
             if state.get("tier") != tier:
@@ -228,7 +263,7 @@ def hook(payload: dict) -> dict | None:
                     log(sid, "after_usage", **usage)
             if remind:
                 return {"hookSpecificOutput": {"hookEventName": event, "additionalContext":
-                        f"Main orchestrator context is approximately {n:,} input tokens ({tier}). Consider compaction at a coherent checkpoint after agents finish. You may defer it to preserve the current phase. Save a handoff first."}}
+                        threshold_reminder(n, tier)}}
     if event == "Stop":
         req = read_json(d / "request.json")
         if not req or req.get("state") != "queued":

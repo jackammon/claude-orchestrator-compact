@@ -38,7 +38,9 @@ The plugin does not edit `~/.claude/settings.json`, shell startup files, or agen
 
 ## Checkpoint policy
 
-The default thresholds are 200K, 300K, and 400K **input** tokens in the latest main conversation API response, including cache-read and cache-write tokens. At 200K the orchestrator begins looking for a natural checkpoint; at 300K it prefers one; at 400K it is urged to use the earliest safe checkpoint. None of these thresholds automatically triggers compaction. The model may continue beyond 400K to finish coherent work. Native safety auto-compaction remains unchanged.
+The default thresholds are 200K, 300K, and 400K **input** tokens in the latest main conversation API response, including cache-read and cache-write tokens. At 200K the orchestrator begins looking for a natural checkpoint; at 300K it prefers one; at 400K it considers the earliest safe checkpoint. These are advisory. The orchestrator decides whether compaction helps and may defer beyond any threshold until a good stopping place, including beyond 400K. Native safety auto-compaction remains unchanged.
+
+`SessionStart` gives the **main orchestrator** that policy, the handoff checklist, and a session-specific request command. Threshold reminders reinforce the policy as context grows. The orchestrator signals by running the local `request` command through its Bash tool; it does not print `/compact` or attempt to run that slash command itself. The request records its decision, and the coordinator handles `/compact` after the main turn ends. Child agents receive no such instruction.
 
 At a checkpoint:
 

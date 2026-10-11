@@ -33,6 +33,25 @@ class CoordinatorTests(unittest.TestCase):
         self.assertIn('additionalContext', result['hookSpecificOutput'])
         return c.read_json(c.session_dir(SID) / 'binding.json')
 
+    def test_main_guidance_keeps_compaction_discretionary(self):
+        result = c.hook({'hook_event_name': 'SessionStart', 'session_id': SID, 'cwd': self.tmp.name})
+        guidance = result['hookSpecificOutput']['additionalContext']
+        for phrase in ('Compaction is your decision', '200,000', '300,000', '400,000',
+                       'may defer even past that threshold', 'good stopping place',
+                       'owner feedback, review, or approval', 'branch/PR/CI state',
+                       'through Bash; do not print `/compact` yourself'):
+            self.assertIn(phrase, guidance)
+        self.assertIn(c.read_json(c.session_dir(SID) / 'binding.json')['token'], guidance)
+
+    def test_custom_thresholds_are_reflected_in_guidance(self):
+        Path(os.environ['ORCH_COMPACT_CONFIG']).write_text(json.dumps({
+            'softThresholdTokens': 1000, 'preferredCompactionTokens': 2000,
+            'escalationThresholdTokens': 3000}))
+        result = c.hook({'hook_event_name': 'SessionStart', 'session_id': SID})
+        guidance = result['hookSpecificOutput']['additionalContext']
+        for threshold in ('1,000', '2,000', '3,000'):
+            self.assertIn(threshold, guidance)
+
     def test_subagent_cannot_register_or_emit_reminder(self):
         self.assertIsNone(c.hook({'hook_event_name': 'SessionStart', 'session_id': SID, 'agent_id': 'agent-1'}))
         self.assertFalse((c.session_dir(SID) / 'binding.json').exists())
@@ -49,6 +68,11 @@ class CoordinatorTests(unittest.TestCase):
                 'cache_creation_input_tokens': 0, 'output_tokens': 900}}}) + '\n')
             c.hook({'hook_event_name': 'PostToolUse', 'session_id': SID, 'transcript_path': str(t)})
             self.assertEqual(c.read_json(c.session_dir(SID) / 'usage.json')['tier'], tier)
+
+    def test_threshold_reminder_preserves_deference(self):
+        reminder = c.threshold_reminder(400000, 'escalated')
+        self.assertIn('you may defer until a good stopping place', reminder)
+        self.assertIn('save a concise handoff', reminder)
 
     def test_request_gates_and_duplicate(self):
         b = self.start()
