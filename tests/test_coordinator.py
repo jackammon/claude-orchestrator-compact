@@ -66,13 +66,32 @@ class CoordinatorTests(unittest.TestCase):
             t.write_text(json.dumps({'type': 'assistant', 'message': {'usage': {
                 'input_tokens': 1, 'cache_read_input_tokens': n - 1,
                 'cache_creation_input_tokens': 0, 'output_tokens': 900}}}) + '\n')
-            c.hook({'hook_event_name': 'PostToolUse', 'session_id': SID, 'transcript_path': str(t)})
+            result = c.hook({'hook_event_name': 'PostToolUse', 'session_id': SID,
+                             'transcript_path': str(t)})
             self.assertEqual(c.read_json(c.session_dir(SID) / 'usage.json')['tier'], tier)
+            if tier == 'escalated':
+                self.assertIn('good stopping place', result['hookSpecificOutput']['additionalContext'])
+            else:
+                self.assertIsNone(result)
 
     def test_threshold_reminder_preserves_deference(self):
-        reminder = c.threshold_reminder(400000, 'escalated')
+        reminder = c.threshold_reminder(400000)
         self.assertIn('you may defer until a good stopping place', reminder)
         self.assertIn('save a concise handoff', reminder)
+
+    def test_escalation_reminder_rearms_after_context_drops(self):
+        self.start()
+        t = Path(self.tmp.name) / 't.jsonl'
+        def observe(n):
+            t.write_text(json.dumps({'type': 'assistant', 'message': {'usage': {
+                'input_tokens': n, 'cache_read_input_tokens': 0,
+                'cache_creation_input_tokens': 0, 'output_tokens': 1}}}) + '\n')
+            return c.hook({'hook_event_name': 'PostToolUse', 'session_id': SID,
+                           'transcript_path': str(t)})
+        self.assertIsNotNone(observe(400000))
+        self.assertIsNone(observe(410000))
+        self.assertIsNone(observe(300000))
+        self.assertIsNotNone(observe(400000))
 
     def test_request_gates_and_duplicate(self):
         b = self.start()

@@ -131,14 +131,10 @@ def orchestrator_guidance(sid: str, token: str, cfg: dict) -> str:
     )
 
 
-def threshold_reminder(n: int, tier: str) -> str:
-    advice = {
-        "soft": "Look for the next natural phase checkpoint.",
-        "preferred": "Prefer compaction at the next safe phase checkpoint.",
-        "escalated": "Consider the earliest safe checkpoint; you may defer until a good stopping place.",
-    }[tier]
-    return (f"Main orchestrator context is approximately {n:,} input tokens ({tier}). "
-            f"{advice} Reconcile agents, clear pending owner decisions, and save a concise handoff before "
+def threshold_reminder(n: int) -> str:
+    return (f"Main orchestrator context is approximately {n:,} input tokens. "
+            "Consider the earliest safe checkpoint; you may defer until a good stopping place. "
+            "Reconcile agents, clear pending owner decisions, and save a concise handoff before "
             "signaling with the session-specific request command. You may defer to preserve useful context.")
 
 
@@ -246,9 +242,11 @@ def hook(payload: dict) -> dict | None:
             state = read_json(d / "usage.json", {})
             if state.get("tier") != tier:
                 log(sid, "threshold", tier=tier, **usage)
-            remind = event != "Stop" and tier != "normal" and state.get("reminded_tier") != tier
+            remind = (event != "Stop" and tier == "escalated" and
+                      state.get("reminded_tier") != "escalated")
             atomic_json(d / "usage.json", {"tier": tier, "time": time.time(),
-                                             "reminded_tier": tier if remind else state.get("reminded_tier"),
+                                             "reminded_tier": ("escalated" if remind else
+                                                               state.get("reminded_tier") if tier == "escalated" else None),
                                              **usage})
             req = read_json(d / "request.json")
             if req and req.get("state") == "confirmed" and "after" not in req:
@@ -263,7 +261,7 @@ def hook(payload: dict) -> dict | None:
                     log(sid, "after_usage", **usage)
             if remind:
                 return {"hookSpecificOutput": {"hookEventName": event, "additionalContext":
-                        threshold_reminder(n, tier)}}
+                        threshold_reminder(n)}}
     if event == "Stop":
         req = read_json(d / "request.json")
         if not req or req.get("state") != "queued":
