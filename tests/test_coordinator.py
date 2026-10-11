@@ -36,7 +36,7 @@ class CoordinatorTests(unittest.TestCase):
     def test_main_guidance_keeps_compaction_discretionary(self):
         result = c.hook({'hook_event_name': 'SessionStart', 'session_id': SID, 'cwd': self.tmp.name})
         guidance = result['hookSpecificOutput']['additionalContext']
-        for phrase in ('Compaction is your decision', '200,000', '300,000', '400,000',
+        for phrase in ('Compaction is your decision', '200,000', '500,000', '600,000',
                        'may defer even past that threshold', 'good stopping place',
                        'owner feedback, review, or approval', 'branch/PR/CI state',
                        'through Bash; do not print `/compact` yourself'):
@@ -62,7 +62,8 @@ class CoordinatorTests(unittest.TestCase):
     def test_thresholds_use_input_cache_counts(self):
         self.start()
         t = Path(self.tmp.name) / 't.jsonl'
-        for n, tier in [(199999, 'normal'), (200000, 'soft'), (300000, 'preferred'), (400000, 'escalated')]:
+        for n, tier in [(199999, 'normal'), (200000, 'soft'), (499999, 'soft'),
+                        (500000, 'preferred'), (599999, 'preferred'), (600000, 'escalated')]:
             t.write_text(json.dumps({'type': 'assistant', 'message': {'usage': {
                 'input_tokens': 1, 'cache_read_input_tokens': n - 1,
                 'cache_creation_input_tokens': 0, 'output_tokens': 900}}}) + '\n')
@@ -75,7 +76,7 @@ class CoordinatorTests(unittest.TestCase):
                 self.assertIsNone(result)
 
     def test_threshold_reminder_preserves_deference(self):
-        reminder = c.threshold_reminder(400000)
+        reminder = c.threshold_reminder(600000)
         self.assertIn('you may defer until a good stopping place', reminder)
         self.assertIn('save a concise handoff', reminder)
 
@@ -88,10 +89,10 @@ class CoordinatorTests(unittest.TestCase):
                 'cache_creation_input_tokens': 0, 'output_tokens': 1}}}) + '\n')
             return c.hook({'hook_event_name': 'PostToolUse', 'session_id': SID,
                            'transcript_path': str(t)})
-        self.assertIsNotNone(observe(400000))
-        self.assertIsNone(observe(410000))
-        self.assertIsNone(observe(300000))
-        self.assertIsNotNone(observe(400000))
+        self.assertIsNotNone(observe(600000))
+        self.assertIsNone(observe(610000))
+        self.assertIsNone(observe(500000))
+        self.assertIsNotNone(observe(600000))
 
     def test_request_gates_and_duplicate(self):
         b = self.start()

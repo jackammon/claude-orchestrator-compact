@@ -1,8 +1,8 @@
 {
   "enabled": true,
   "softThresholdTokens": 200000,
-  "preferredCompactionTokens": 300000,
-  "escalationThresholdTokens": 400000,
+  "preferredCompactionTokens": 500000,
+  "escalationThresholdTokens": 600000,
   "requirePhaseCheckpoint": true,
   "requireNoActiveSubagents": true,
   "requireOwnerInputClear": true,

@@ -1,6 +1,6 @@
 # Validation record
 
-Tested on 2026-10-10 with Claude Code CLI 2.1.296, tmux 3.8, and Haiku 5.5 at low effort in `/private/tmp/oc-live-project`. The test config used 1, 2, and 3 token thresholds; the normal 200K/300K/400K policy was not changed. No active Headway session was used.
+Tested on 2026-10-10 with Claude Code CLI 2.1.296, tmux 3.8, and Haiku 5.5 at low effort in `/private/tmp/oc-live-project`. The test config used 1, 2, and 3 token thresholds so the workflow could be exercised cheaply. The current default policy is 200K/500K/600K; it has not been validated with a 600K-token session. No active Headway session was used.
 
 | Check | Result | Evidence |
 | --- | --- | --- |
@@ -14,7 +14,7 @@ Tested on 2026-10-10 with Claude Code CLI 2.1.296, tmux 3.8, and Haiku 5.5 at lo
 | Native child lifecycle | Pass | One native Explore subagent started and stopped; active tracking returned to empty and no plugin compaction targeted the child. |
 | Multiple sessions | Pass | Two simultaneous Claude panes had distinct bindings; using the second session's token from the first pane failed. A request in the second pane was cancelled. |
 | Pending user input | Pass in controlled test | Unsent text in the second pane caused delivery to fail without injecting `/compact`. This does not prove absence of a simultaneous keystroke race. |
-| Automated tests | Pass | 17 local tests, including thresholds, gates, duplicate prevention, child tracking, resume, and stale telemetry. |
+| Automated tests | Pass | 21 local tests, including thresholds, reminder timing, gates, duplicate prevention, child tracking, resume, and stale telemetry. |
 
 The first run reported 41,122 input tokens before compaction and a subsequent sample of 35,539 after compaction. These are latest-response input-context measurements, not a billed cost comparison. This small test does not establish cost savings or performance at 200K tokens.
 

@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 
 DEFAULTS = {"enabled": True, "softThresholdTokens": 200000,
-            "preferredCompactionTokens": 300000, "escalationThresholdTokens": 400000,
+            "preferredCompactionTokens": 500000, "escalationThresholdTokens": 600000,
             "requestTtlSeconds": 300, "debounceSeconds": 300,
             "requirePhaseCheckpoint": True, "requireNoActiveSubagents": True,
             "requireOwnerInputClear": True,
