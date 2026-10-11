@@ -36,21 +36,21 @@ class CoordinatorTests(unittest.TestCase):
     def test_main_guidance_keeps_compaction_discretionary(self):
         result = c.hook({'hook_event_name': 'SessionStart', 'session_id': SID, 'cwd': self.tmp.name})
         guidance = result['hookSpecificOutput']['additionalContext']
-        for phrase in ('Compaction is your decision', '200,000', '500,000', '600,000',
-                       'may defer even past that threshold', 'good stopping place',
+        for phrase in ('Compaction is your decision', '600,000',
+                       'at any coherent phase checkpoint', 'good stopping place',
                        'owner feedback, review, or approval', 'branch/PR/CI state',
                        'through Bash; do not print `/compact` yourself'):
             self.assertIn(phrase, guidance)
+        self.assertNotIn('--force', guidance)
         self.assertIn(c.read_json(c.session_dir(SID) / 'binding.json')['token'], guidance)
 
-    def test_custom_thresholds_are_reflected_in_guidance(self):
+    def test_custom_reminder_threshold_is_reflected_in_guidance(self):
         Path(os.environ['ORCH_COMPACT_CONFIG']).write_text(json.dumps({
-            'softThresholdTokens': 1000, 'preferredCompactionTokens': 2000,
-            'escalationThresholdTokens': 3000}))
+            'reminderThresholdTokens': 3000}))
         result = c.hook({'hook_event_name': 'SessionStart', 'session_id': SID})
         guidance = result['hookSpecificOutput']['additionalContext']
-        for threshold in ('1,000', '2,000', '3,000'):
-            self.assertIn(threshold, guidance)
+        self.assertIn('3,000', guidance)
+        self.assertNotIn('600,000', guidance)
 
     def test_subagent_cannot_register_or_emit_reminder(self):
         self.assertIsNone(c.hook({'hook_event_name': 'SessionStart', 'session_id': SID, 'agent_id': 'agent-1'}))
@@ -59,18 +59,18 @@ class CoordinatorTests(unittest.TestCase):
         self.assertIsNone(c.hook({'hook_event_name': 'PostToolUse', 'session_id': SID,
                                   'agent_id': 'agent-1', 'transcript_path': 'anything'}))
 
-    def test_thresholds_use_input_cache_counts(self):
+    def test_only_reminder_threshold_uses_input_cache_counts(self):
         self.start()
         t = Path(self.tmp.name) / 't.jsonl'
-        for n, tier in [(199999, 'normal'), (200000, 'soft'), (499999, 'soft'),
-                        (500000, 'preferred'), (599999, 'preferred'), (600000, 'escalated')]:
+        for n, above in [(199999, False), (200000, False), (500000, False),
+                         (599999, False), (600000, True)]:
             t.write_text(json.dumps({'type': 'assistant', 'message': {'usage': {
                 'input_tokens': 1, 'cache_read_input_tokens': n - 1,
                 'cache_creation_input_tokens': 0, 'output_tokens': 900}}}) + '\n')
             result = c.hook({'hook_event_name': 'PostToolUse', 'session_id': SID,
                              'transcript_path': str(t)})
-            self.assertEqual(c.read_json(c.session_dir(SID) / 'usage.json')['tier'], tier)
-            if tier == 'escalated':
+            self.assertEqual(c.read_json(c.session_dir(SID) / 'usage.json')['above_reminder'], above)
+            if above:
                 self.assertIn('good stopping place', result['hookSpecificOutput']['additionalContext'])
             else:
                 self.assertIsNone(result)
@@ -101,13 +101,11 @@ class CoordinatorTests(unittest.TestCase):
         class Args: pass
         a = Args()
         a.session, a.token, a.handoff, a.reason = SID, b['token'], str(handoff), 'phase done'
-        a.agents_reconciled, a.owner_input_clear, a.force = False, False, False
+        a.agents_reconciled, a.owner_input_clear = False, False
         with self.assertRaises(ValueError): c.request(a)
         a.agents_reconciled = True
         with self.assertRaises(ValueError): c.request(a)
         a.owner_input_clear = True
-        with self.assertRaises(ValueError): c.request(a)
-        a.force = True
         self.assertEqual(c.request(a), 0)
         with self.assertRaises(ValueError): c.request(a)
 
@@ -118,7 +116,7 @@ class CoordinatorTests(unittest.TestCase):
         class Args: pass
         a = Args()
         a.session, a.token, a.handoff, a.reason = SID, b['token'], str(handoff), 'phase done'
-        a.agents_reconciled, a.owner_input_clear, a.force = True, True, True
+        a.agents_reconciled, a.owner_input_clear = True, True
         c.request(a)
         with patch.object(c.subprocess, 'Popen') as popen:
             c.hook({'hook_event_name': 'Stop', 'session_id': SID, 'background_tasks': [{'type':'subagent'}]})
@@ -229,9 +227,12 @@ class CoordinatorTests(unittest.TestCase):
             popen.assert_not_called()
         self.assertEqual(c.read_json(c.session_dir(SID) / 'request.json')['state'], 'expired')
 
-    def test_config_invalid_order_fails_closed(self):
+    def test_invalid_config_fails_closed(self):
         Path(os.environ['ORCH_COMPACT_CONFIG']).write_text(
-            json.dumps({'softThresholdTokens':400000, 'preferredCompactionTokens':300000}))
+            json.dumps({'reminderThresholdTokens': -1}))
+        with self.assertRaises(ValueError): c.config()
+        Path(os.environ['ORCH_COMPACT_CONFIG']).write_text(
+            json.dumps({'softThresholdTokens': 200000}))
         with self.assertRaises(ValueError): c.config()
         Path(os.environ['ORCH_COMPACT_CONFIG']).write_text(
             json.dumps({'preserveHandoff': False}))

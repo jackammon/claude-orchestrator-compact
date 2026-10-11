@@ -38,7 +38,7 @@ The plugin does not edit `~/.claude/settings.json`, shell startup files, or agen
 
 ## Checkpoint policy
 
-The default thresholds are 200K, 500K, and 600K **input** tokens in the latest main conversation API response, including cache-read and cache-write tokens. At 200K the orchestrator begins looking for a natural checkpoint; at 500K it prefers one; at 600K it considers the earliest safe checkpoint. These are advisory. The orchestrator decides whether compaction helps and may defer beyond any threshold until a good stopping place, including beyond 600K. **There are no threshold reminders at 200K or 500K.** The hook gives one reminder when observed usage reaches 600K; it can remind again after context falls below 600K and later crosses it again. Native safety auto-compaction remains unchanged.
+The only threshold is a **600K input-token reminder** based on the latest main conversation API response, including cache-read and cache-write tokens. The main orchestrator can request compaction at any earlier or later coherent checkpoint. At 600K, the hook reminds it once to consider compaction; it may defer until a good stopping place. The reminder can rearm after context falls below 600K and later crosses it again. Native safety auto-compaction remains unchanged.
 
 `SessionStart` gives the **main orchestrator** that policy, the handoff checklist, and a session-specific request command. The orchestrator signals by running the local `request` command through its Bash tool; it does not print `/compact` or attempt to run that slash command itself. The request records its decision, and the coordinator handles `/compact` after the main turn ends. Child agents receive no such instruction.
 
@@ -46,7 +46,7 @@ At a checkpoint:
 
 1. Finish and reconcile the current batch of subagents. The main `Stop` hook also requires Claude Code's `background_tasks` array to be present and empty.
 2. Save a concise durable handoff in the project's existing planning location. Record what is done, outstanding work, agent results, branch/PR/CI state, decisions, blockers, and next actions. Keep it under 32 KiB.
-3. Use the session-specific command injected by `SessionStart` to queue the request, supplying the handoff path, a short reason, `--agents-reconciled`, and `--owner-input-clear`. Assert the last flag only when no owner answer, review, or approval is pending. At a deliberate checkpoint below 200K, add `--force`.
+3. Use the session-specific command injected by `SessionStart` to queue the request, supplying the handoff path, a short reason, `--agents-reconciled`, and `--owner-input-clear`. Assert the last flag only when no owner answer, review, or approval is pending. No token minimum or `--force` flag applies.
 4. Allow the main agent to finish its turn. The `Stop` hook queues delivery; the worker checks that the exact bound tmux pane still exists and shows a stable empty prompt.
 5. `PostCompact` confirms the manual compaction. With `resumeAfterCompaction` enabled, a second worker waits for the same pane to show a stable empty prompt, then asks Claude to read the handoff, check repository status, and continue. This path passed a disposable Haiku 5.5 test.
 
@@ -56,7 +56,7 @@ A new owner prompt cancels a queued request or pending continuation. The request
 
 Copy [`config.example.json`](config.example.json) to `~/.config/claude-orchestrator-compact/config.json`, or set `ORCH_COMPACT_CONFIG` to another path. `ORCH_COMPACT_STATE_DIR` controls the private local state and log directory (default `~/.local/state/claude-orchestrator-compact`). Set `enabled` to `false` to disable. The example enables continuation. Set `resumeAfterCompaction` to `false` if you want compaction to return to an idle prompt. The coordinator requires an explicit owner-clearance assertion before queueing.
 
-Each session has `usage.json`, `binding.json`, `request.json`, `agents.json`, and `events.jsonl`. The event log contains timestamps, counters, threshold transitions, and request state. It never logs the conversation or compact summary. `binding.json` contains a session token, so keep the state directory private.
+Each session has `usage.json`, `binding.json`, `request.json`, `agents.json`, and `events.jsonl`. The event log contains timestamps, counters, crossing of the reminder threshold, and request state. It never logs the conversation or compact summary. `binding.json` contains a session token, so keep the state directory private.
 
 ## Cost measurement
 

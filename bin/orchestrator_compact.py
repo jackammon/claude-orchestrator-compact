@@ -14,10 +14,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-DEFAULTS = {"enabled": True, "softThresholdTokens": 200000,
-            "preferredCompactionTokens": 500000, "escalationThresholdTokens": 600000,
+DEFAULTS = {"enabled": True, "reminderThresholdTokens": 600000,
             "requestTtlSeconds": 300, "debounceSeconds": 300,
-            "requirePhaseCheckpoint": True, "requireNoActiveSubagents": True,
+            "requireNoActiveSubagents": True,
             "requireOwnerInputClear": True,
             "preserveHandoff": True, "resumeAfterCompaction": True,
             "telemetryEnabled": True}
@@ -37,19 +36,16 @@ def config() -> dict:
         if not isinstance(data, dict) or set(data) - set(cfg):
             raise ValueError("invalid configuration keys")
         cfg.update(data)
-    for k in ("softThresholdTokens", "preferredCompactionTokens", "escalationThresholdTokens"):
-        if type(cfg[k]) is not int or cfg[k] < 0:
-            raise ValueError(f"invalid {k}")
+    if type(cfg["reminderThresholdTokens"]) is not int or cfg["reminderThresholdTokens"] < 0:
+        raise ValueError("invalid reminderThresholdTokens")
     for k in ("requestTtlSeconds", "debounceSeconds"):
         if type(cfg[k]) is not int or cfg[k] < 0:
             raise ValueError(f"invalid {k}")
-    for k in ("enabled", "requirePhaseCheckpoint", "requireNoActiveSubagents",
+    for k in ("enabled", "requireNoActiveSubagents",
               "requireOwnerInputClear", "preserveHandoff", "resumeAfterCompaction",
               "telemetryEnabled"):
         if type(cfg[k]) is not bool:
             raise ValueError(f"invalid {k}")
-    if not cfg["softThresholdTokens"] <= cfg["preferredCompactionTokens"] <= cfg["escalationThresholdTokens"]:
-        raise ValueError("threshold order")
     if not cfg["preserveHandoff"]:
         raise ValueError("handoff preservation is required")
     return cfg
@@ -111,13 +107,10 @@ def orchestrator_guidance(sid: str, token: str, cfg: dict) -> str:
     command = (f"python3 {Path(__file__).resolve()} request --session {sid} --token {token} "
                "--handoff ABSOLUTE_PATH --reason SHORT_REASON --agents-reconciled --owner-input-clear")
     return (
-        "Main orchestrator only. Compaction is your decision; thresholds are advisory, never a mandatory "
-        "token cutoff: "
-        f"below {cfg['softThresholdTokens']:,} input tokens, continue normally; at "
-        f"{cfg['softThresholdTokens']:,}, look for a natural phase checkpoint; at "
-        f"{cfg['preferredCompactionTokens']:,}, prefer the next safe checkpoint; at "
-        f"{cfg['escalationThresholdTokens']:,}, consider the earliest safe checkpoint. You may defer even "
-        "past that threshold until a good stopping place. Consider whether compaction would discard useful working "
+        "Main orchestrator only. Compaction is your decision at any coherent phase checkpoint. "
+        f"At approximately {cfg['reminderThresholdTokens']:,} input tokens, a one-time reminder will ask "
+        "you to consider it. This is advisory, never a mandatory token cutoff; you may defer until a good "
+        "stopping place. Consider whether compaction would discard useful working "
         "context, harm answer quality, or increase rather than reduce cost. "
         "Before requesting, finish and reconcile all child work, ensure no owner feedback, review, or approval "
         "is pending, and save a concise durable handoff in the project's existing planning location: current "
@@ -125,7 +118,7 @@ def orchestrator_guidance(sid: str, token: str, cfg: dict) -> str:
         "and concrete next actions. Do not create a redundant large document. "
         f"Signal by running `{command}` through Bash; do not print `/compact` yourself. "
         "Use --agents-reconciled and --owner-input-clear only when those assertions are true. "
-        "For a deliberate checkpoint below the soft threshold, add --force. Then finish your turn. "
+        "You may request compaction before or after the reminder. Then finish your turn. "
         "The coordinator checks the empty background-task registry at main Stop, enters `/compact` in this "
         "session's tmux pane, and resumes from the handoff after confirmation. Never request this from a subagent."
     )
@@ -238,15 +231,15 @@ def hook(payload: dict) -> dict | None:
         usage = usage_from_transcript(payload.get("transcript_path", ""))
         if usage:
             n = usage["context_input_tokens"]
-            tier = "escalated" if n >= cfg["escalationThresholdTokens"] else "preferred" if n >= cfg["preferredCompactionTokens"] else "soft" if n >= cfg["softThresholdTokens"] else "normal"
             state = read_json(d / "usage.json", {})
-            if state.get("tier") != tier:
-                log(sid, "threshold", tier=tier, **usage)
-            remind = (event != "Stop" and tier == "escalated" and
-                      state.get("reminded_tier") != "escalated")
-            atomic_json(d / "usage.json", {"tier": tier, "time": time.time(),
-                                             "reminded_tier": ("escalated" if remind else
-                                                               state.get("reminded_tier") if tier == "escalated" else None),
+            above = n >= cfg["reminderThresholdTokens"]
+            if above and not state.get("above_reminder"):
+                log(sid, "reminder_threshold", **usage)
+            remind = (event != "Stop" and above and
+                      not state.get("reminded_above_threshold", False))
+            atomic_json(d / "usage.json", {"above_reminder": above, "time": time.time(),
+                                             "reminded_above_threshold":
+                                                 above and (remind or state.get("reminded_above_threshold", False)),
                                              **usage})
             req = read_json(d / "request.json")
             if req and req.get("state") == "confirmed" and "after" not in req:
@@ -329,8 +322,6 @@ def request(args) -> int:
     if last.get("state") == "confirmed" and time.time() - last.get("created", 0) < cfg["debounceSeconds"]:
         raise ValueError("debounced")
     usage = read_json(d / "usage.json", {})
-    if usage.get("tier", "normal") == "normal" and cfg["requirePhaseCheckpoint"] and not args.force:
-        raise ValueError("below soft threshold; use --force for a deliberate phase checkpoint")
     atomic_json(d / "request.json", {"state": "queued", "created": time.time(),
                                      "handoff": str(handoff), "reason": args.reason[:200],
                                      "before": usage.get("context_input_tokens")})
@@ -424,7 +415,6 @@ def main() -> int:
     q.add_argument("--reason", required=True)
     q.add_argument("--agents-reconciled", action="store_true")
     q.add_argument("--owner-input-clear", action="store_true")
-    q.add_argument("--force", action="store_true")
     x = sub.add_parser("deliver")
     x.add_argument("--session", required=True)
     x = sub.add_parser("resume")

@@ -1,9 +1,6 @@
 {
   "enabled": true,
-  "softThresholdTokens": 200000,
-  "preferredCompactionTokens": 500000,
-  "escalationThresholdTokens": 600000,
-  "requirePhaseCheckpoint": true,
+  "reminderThresholdTokens": 600000,
   "requireNoActiveSubagents": true,
   "requireOwnerInputClear": true,
   "preserveHandoff": true,
