@@ -5,7 +5,8 @@
   "escalationThresholdTokens": 400000,
   "requirePhaseCheckpoint": true,
   "requireNoActiveSubagents": true,
+  "requireOwnerInputClear": true,
   "preserveHandoff": true,
-  "resumeAfterCompaction": false,
+  "resumeAfterCompaction": true,
   "telemetryEnabled": true
 }

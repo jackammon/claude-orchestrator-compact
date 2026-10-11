@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -10,13 +11,15 @@ import secrets
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 DEFAULTS = {"enabled": True, "softThresholdTokens": 200000,
             "preferredCompactionTokens": 300000, "escalationThresholdTokens": 400000,
             "requestTtlSeconds": 300, "debounceSeconds": 300,
             "requirePhaseCheckpoint": True, "requireNoActiveSubagents": True,
-            "preserveHandoff": True, "resumeAfterCompaction": False,
+            "requireOwnerInputClear": True,
+            "preserveHandoff": True, "resumeAfterCompaction": True,
             "telemetryEnabled": True}
 UUID = re.compile(r"^[0-9a-fA-F-]{16,64}$")
 PANE = re.compile(r"^%[0-9]+$")
@@ -37,8 +40,18 @@ def config() -> dict:
     for k in ("softThresholdTokens", "preferredCompactionTokens", "escalationThresholdTokens"):
         if type(cfg[k]) is not int or cfg[k] < 0:
             raise ValueError(f"invalid {k}")
+    for k in ("requestTtlSeconds", "debounceSeconds"):
+        if type(cfg[k]) is not int or cfg[k] < 0:
+            raise ValueError(f"invalid {k}")
+    for k in ("enabled", "requirePhaseCheckpoint", "requireNoActiveSubagents",
+              "requireOwnerInputClear", "preserveHandoff", "resumeAfterCompaction",
+              "telemetryEnabled"):
+        if type(cfg[k]) is not bool:
+            raise ValueError(f"invalid {k}")
     if not cfg["softThresholdTokens"] <= cfg["preferredCompactionTokens"] <= cfg["escalationThresholdTokens"]:
         raise ValueError("threshold order")
+    if not cfg["preserveHandoff"]:
+        raise ValueError("handoff preservation is required")
     return cfg
 
 
@@ -94,6 +107,23 @@ def main_only(payload: dict) -> bool:
     return not payload.get("agent_id") and not payload.get("agent_type") and isinstance(payload.get("session_id"), str)
 
 
+def active_agents(sid: str, event: str | None = None, agent_id: str | None = None) -> list[str]:
+    """Track child lifecycle with a lock; an unmatched start fails closed."""
+    d = session_dir(sid)
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (d / "agents.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = d / "agents.json"
+        agents = set(read_json(path, []))
+        if event == "SubagentStart" and agent_id:
+            agents.add(agent_id)
+        elif event == "SubagentStop" and agent_id:
+            agents.discard(agent_id)
+        if event:
+            atomic_json(path, sorted(agents))
+        return sorted(agents)
+
+
 def usage_from_transcript(path: str) -> dict | None:
     """Latest reported main conversation usage; transcript writes can lag."""
     try:
@@ -101,6 +131,7 @@ def usage_from_transcript(path: str) -> dict | None:
         if "subagents" in p.parts or not p.is_file():
             return None
         last = None
+        response_time = None
         with p.open() as f:
             for line in f:
                 try:
@@ -110,6 +141,7 @@ def usage_from_transcript(path: str) -> dict | None:
                     usage = (entry.get("message") or {}).get("usage")
                     if isinstance(usage, dict):
                         last = usage
+                        response_time = entry.get("timestamp")
                 except (ValueError, TypeError):
                     continue
         if not last:
@@ -119,17 +151,28 @@ def usage_from_transcript(path: str) -> dict | None:
         if any(type(v) is not int or v < 0 for v in vals.values()):
             return None
         vals["context_input_tokens"] = sum(vals[k] for k in keys[:3])
+        vals["response_time"] = response_time
         return vals
     except OSError:
         return None
 
 
 def hook(payload: dict) -> dict | None:
-    if not config()["enabled"] or not main_only(payload):
+    if not config()["enabled"]:
+        return None
+    event = payload.get("hook_event_name")
+    sid = payload.get("session_id")
+    if event in ("SubagentStart", "SubagentStop"):
+        if isinstance(sid, str) and isinstance(payload.get("agent_id"), str):
+            if read_json(session_dir(sid) / "binding.json"):
+                agents = active_agents(sid, event, payload["agent_id"])
+                log(sid, "agent_start" if event == "SubagentStart" else "agent_stop",
+                    active_count=len(agents))
+        return None
+    if not main_only(payload):
         return None
     sid = payload["session_id"]
     d = session_dir(sid)
-    event = payload.get("hook_event_name")
     if event == "SessionStart":
         pane = os.environ.get("TMUX_PANE", "")
         if not PANE.fullmatch(pane):
@@ -145,10 +188,20 @@ def hook(payload: dict) -> dict | None:
                                            "cwd": payload.get("cwd"), "created": time.time()})
         log(sid, "session_start", pane=pane)
         return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext":
-                f"Main orchestrator only: at phase checkpoints, inspect context reminders. If compaction helps, save a durable handoff and call `python3 {Path(__file__).resolve()} request --session {sid} --token {token} --handoff ABSOLUTE_PATH --reason SHORT_REASON --agents-reconciled`. Never do this from a subagent. This coordinator requires an empty background task registry at Stop."}}
+                f"Main orchestrator only: at phase checkpoints, inspect context reminders. If compaction helps, save a durable handoff and call `python3 {Path(__file__).resolve()} request --session {sid} --token {token} --handoff ABSOLUTE_PATH --reason SHORT_REASON --agents-reconciled --owner-input-clear`. Assert owner-input-clear only when no owner answer or approval is pending. Never do this from a subagent. This coordinator requires an empty background task registry at Stop."}}
     binding = read_json(d / "binding.json")
     if not binding:
         return None
+    if event == "UserPromptSubmit":
+        req = read_json(d / "request.json")
+        if req and req.get("state") in ("queued", "stop_seen"):
+            req["state"] = "cancelled"
+            atomic_json(d / "request.json", req)
+            log(sid, "cancelled", reason="new_user_prompt")
+        elif req and req.get("state") == "confirmed" and req.get("resume_state") == "pending":
+            req["resume_state"] = "cancelled"
+            atomic_json(d / "request.json", req)
+            log(sid, "resume_cancelled", reason="new_user_prompt")
     if event in ("UserPromptSubmit", "PostToolUse", "Stop"):
         usage = usage_from_transcript(payload.get("transcript_path", ""))
         if usage:
@@ -162,6 +215,17 @@ def hook(payload: dict) -> dict | None:
             atomic_json(d / "usage.json", {"tier": tier, "time": time.time(),
                                              "reminded_tier": tier if remind else state.get("reminded_tier"),
                                              **usage})
+            req = read_json(d / "request.json")
+            if req and req.get("state") == "confirmed" and "after" not in req:
+                try:
+                    response_epoch = datetime.fromisoformat(
+                        usage["response_time"].replace("Z", "+00:00")).timestamp()
+                except (TypeError, ValueError, AttributeError):
+                    response_epoch = 0
+                if response_epoch > req.get("confirmed_at", float("inf")):
+                    req["after"] = n
+                    atomic_json(d / "request.json", req)
+                    log(sid, "after_usage", **usage)
             if remind:
                 return {"hookSpecificOutput": {"hookEventName": event, "additionalContext":
                         f"Main orchestrator context is approximately {n:,} input tokens ({tier}). Consider compaction at a coherent checkpoint after agents finish. You may defer it to preserve the current phase. Save a handoff first."}}
@@ -171,6 +235,9 @@ def hook(payload: dict) -> dict | None:
             return None
         if not isinstance(payload.get("background_tasks"), list) or payload["background_tasks"]:
             log(sid, "deferred", reason="background_tasks")
+            return None
+        if active_agents(sid):
+            log(sid, "deferred", reason="active_subagents")
             return None
         if time.time() - req.get("created", 0) > config()["requestTtlSeconds"]:
             req["state"] = "expired"
@@ -191,10 +258,16 @@ def hook(payload: dict) -> dict | None:
         log(sid, "stop_seen")
     if event == "PostCompact":
         req = read_json(d / "request.json")
-        if req and req.get("state") in ("stop_seen", "sent"):
+        if req and req.get("state") in ("stop_seen", "sent") and payload.get("trigger") == "manual":
             req["state"] = "confirmed"
+            req["confirmed_at"] = time.time()
+            req["resume_state"] = "pending" if config()["resumeAfterCompaction"] else "disabled"
             atomic_json(d / "request.json", req)
             log(sid, "confirmed", trigger=payload.get("trigger"))
+            if req["resume_state"] == "pending":
+                subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "resume", "--session", sid],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
     return None
 
 
@@ -210,6 +283,8 @@ def request(args) -> int:
         raise ValueError("wrong pane")
     if cfg["requireNoActiveSubagents"] and not args.agents_reconciled:
         raise ValueError("agent reconciliation required")
+    if cfg["requireOwnerInputClear"] and not args.owner_input_clear:
+        raise ValueError("owner input or approval clearance required")
     handoff = Path(args.handoff).resolve(strict=True)
     if any(ord(ch) < 32 for ch in str(handoff)):
         raise ValueError("unsafe handoff path")
@@ -236,6 +311,21 @@ def idle_prompt_visible(screen: str) -> bool:
     return any(re.match(r"^❯(?:\s*$|\s+Try\s)", line) for line in lines[-4:])
 
 
+def wait_for_idle_pane(binding: dict) -> None:
+    expected = {k: binding[k] for k in ("pane", "pid", "tty", "command")}
+    if pane_identity(binding["pane"]) != expected:
+        raise ValueError("pane changed")
+    for _ in range(20):
+        screen = tmux("capture-pane", "-p", "-t", binding["pane"])
+        if idle_prompt_visible(screen):
+            time.sleep(0.8)
+            again = tmux("capture-pane", "-p", "-t", binding["pane"])
+            if again == screen and pane_identity(binding["pane"]) == expected:
+                return
+        time.sleep(0.5)
+    raise ValueError("empty idle prompt not verified")
+
+
 def deliver(sid: str) -> int:
     """Conservative terminal delivery. Any ambiguous screen or identity aborts."""
     d = session_dir(sid)
@@ -244,20 +334,7 @@ def deliver(sid: str) -> int:
     if not req or req.get("state") != "stop_seen" or not binding:
         return 2
     try:
-        if pane_identity(binding["pane"]) != {k: binding[k] for k in ("pane", "pid", "tty", "command")}:
-            raise ValueError("pane changed")
-        # The interactive prompt is visible only after the Stop hook exits.
-        # Require a stable, empty Claude prompt twice. This is a best-effort UI check.
-        for _ in range(20):
-            screen = tmux("capture-pane", "-p", "-t", binding["pane"])
-            if idle_prompt_visible(screen):
-                time.sleep(0.8)
-                again = tmux("capture-pane", "-p", "-t", binding["pane"])
-                if again == screen and pane_identity(binding["pane"]) == {k: binding[k] for k in ("pane", "pid", "tty", "command")}:
-                    break
-            time.sleep(0.5)
-        else:
-            raise ValueError("empty idle prompt not verified")
+        wait_for_idle_pane(binding)
         if read_json(d / "request.json", {}).get("state") != "stop_seen":
             raise ValueError("request changed")
         # No user-provided text enters the command; the handoff is already on disk.
@@ -275,6 +352,34 @@ def deliver(sid: str) -> int:
         return 2
 
 
+def resume(sid: str) -> int:
+    d = session_dir(sid)
+    req = read_json(d / "request.json")
+    binding = read_json(d / "binding.json")
+    if not req or req.get("state") != "confirmed" or req.get("resume_state") != "pending" or not binding:
+        return 2
+    try:
+        wait_for_idle_pane(binding)
+        current = read_json(d / "request.json", {})
+        if current.get("state") != "confirmed" or current.get("resume_state") != "pending":
+            raise ValueError("resume changed")
+        if active_agents(sid):
+            raise ValueError("active subagents")
+        prompt = f"Read the durable handoff at {req['handoff']} and continue the next phase. First confirm the current repository status."
+        req["resume_state"] = "sent"
+        atomic_json(d / "request.json", req)
+        tmux("send-keys", "-t", binding["pane"], "-l", prompt)
+        time.sleep(0.5)
+        tmux("send-keys", "-t", binding["pane"], "Enter")
+        log(sid, "resume_sent")
+        return 0
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        req["resume_state"] = "failed"
+        atomic_json(d / "request.json", req)
+        log(sid, "resume_failed", reason=str(e))
+        return 2
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="command", required=True)
@@ -285,8 +390,11 @@ def main() -> int:
     q.add_argument("--handoff", required=True)
     q.add_argument("--reason", required=True)
     q.add_argument("--agents-reconciled", action="store_true")
+    q.add_argument("--owner-input-clear", action="store_true")
     q.add_argument("--force", action="store_true")
     x = sub.add_parser("deliver")
+    x.add_argument("--session", required=True)
+    x = sub.add_parser("resume")
     x.add_argument("--session", required=True)
     x = sub.add_parser("status")
     x.add_argument("--session", required=True)
@@ -302,14 +410,20 @@ def main() -> int:
             return request(a)
         elif a.command == "deliver":
             return deliver(a.session)
+        elif a.command == "resume":
+            return resume(a.session)
         elif a.command == "status":
             print(json.dumps({"usage": read_json(session_dir(a.session) / "usage.json"),
                               "request": read_json(session_dir(a.session) / "request.json")}, indent=2))
         elif a.command == "cancel":
             path = session_dir(a.session) / "request.json"
             req = read_json(path)
-            if req and req.get("state") in ("queued", "stop_seen"):
-                req["state"] = "cancelled"
+            if req and (req.get("state") in ("queued", "stop_seen") or
+                        req.get("resume_state") == "pending"):
+                if req.get("resume_state") == "pending":
+                    req["resume_state"] = "cancelled"
+                else:
+                    req["state"] = "cancelled"
                 atomic_json(path, req)
                 log(a.session, "cancelled")
         return 0

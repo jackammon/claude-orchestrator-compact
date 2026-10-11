@@ -15,13 +15,13 @@ Research checked against Claude Code documentation on 2026-10-10 and installed C
 
 ## State machine
 
-`SessionStart` binds a Claude `session_id` to one tmux pane ID, pane PID, TTY, and current command. Only `claude` panes are accepted. A random token is injected into the main session's context for requests. `PostToolUse` and `UserPromptSubmit` read the latest main transcript usage and report threshold transitions. An explicit request requires a readable, nonempty handoff under 32 KiB and an agent reconciliation assertion. `Stop` requires a present empty task registry and unchanged pane identity. The detached worker waits for a stable empty prompt, rechecks the request, and sends `/compact` to the bound pane. `PostCompact` marks success; an absent event leaves the state unconfirmed.
+`SessionStart` binds a Claude `session_id` to one tmux pane ID, pane PID, TTY, and current command. Only `claude` panes are accepted. A random token is injected into the main session's context for requests. `PostToolUse` and `UserPromptSubmit` read the latest main transcript usage and report threshold transitions. An explicit request requires a readable, nonempty handoff under 32 KiB, an agent reconciliation assertion, and an assertion that no owner answer or approval is pending. `SubagentStart` and `SubagentStop` track children. `Stop` requires an empty tracked child set, a present empty task registry, and unchanged pane identity. The detached worker waits for a stable empty prompt, rechecks the request, and sends `/compact` to the bound pane. `PostCompact` confirms the manual compaction and, when enabled, queues continuation in that same pane. A new owner prompt cancels a queued request or pending continuation.
 
-`queued -> stop_seen -> sent -> confirmed` is the normal path. Requests may also be `cancelled`, `expired`, or `failed`. No state transition is allowed from a subagent hook.
+`queued -> stop_seen -> sent -> confirmed -> resume_sent` is the normal path. Requests may also be `cancelled`, `expired`, or `failed`. No state transition is allowed from a subagent hook.
 
 ## Reliability boundary
 
-Claude Code does not expose an official interactive-idle/input-buffer API to command hooks. The tmux prompt check is heuristic and cannot prove the user will not type between check and injection. Therefore this is an experimental best-effort coordinator rather than a fully reliable unattended solution. The plugin does not claim complete end-to-end acceptance until a safe official API or stronger terminal ownership protocol exists. It never writes to a child agent pane, but a collision with user input in the main pane remains possible.
+Claude Code does not expose an official interactive-idle/input-buffer API to command hooks. The tmux prompt check is heuristic and cannot prove the user will not type between check and injection. Therefore this is an experimental best-effort coordinator rather than a fully reliable unattended solution. A disposable Haiku 5.5 test validated the sequence under controlled conditions, but the plugin does not claim a race-free unattended guarantee until a safe official API or stronger terminal ownership protocol exists. It never writes to a child agent pane, but a collision with user input in the main pane remains possible.
 
 ## Attribution
 

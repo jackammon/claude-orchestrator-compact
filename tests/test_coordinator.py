@@ -57,9 +57,11 @@ class CoordinatorTests(unittest.TestCase):
         class Args: pass
         a = Args()
         a.session, a.token, a.handoff, a.reason = SID, b['token'], str(handoff), 'phase done'
-        a.agents_reconciled, a.force = False, False
+        a.agents_reconciled, a.owner_input_clear, a.force = False, False, False
         with self.assertRaises(ValueError): c.request(a)
         a.agents_reconciled = True
+        with self.assertRaises(ValueError): c.request(a)
+        a.owner_input_clear = True
         with self.assertRaises(ValueError): c.request(a)
         a.force = True
         self.assertEqual(c.request(a), 0)
@@ -72,7 +74,7 @@ class CoordinatorTests(unittest.TestCase):
         class Args: pass
         a = Args()
         a.session, a.token, a.handoff, a.reason = SID, b['token'], str(handoff), 'phase done'
-        a.agents_reconciled, a.force = True, True
+        a.agents_reconciled, a.owner_input_clear, a.force = True, True, True
         c.request(a)
         with patch.object(c.subprocess, 'Popen') as popen:
             c.hook({'hook_event_name': 'Stop', 'session_id': SID, 'background_tasks': [{'type':'subagent'}]})
@@ -81,6 +83,66 @@ class CoordinatorTests(unittest.TestCase):
             c.hook({'hook_event_name': 'Stop', 'session_id': SID, 'background_tasks': []})
             popen.assert_called_once()
             self.assertEqual(c.read_json(c.session_dir(SID) / 'request.json')['state'], 'stop_seen')
+
+    def test_child_lifecycle_blocks_main_compaction(self):
+        self.start()
+        c.hook({'hook_event_name': 'SubagentStart', 'session_id': SID,
+                'agent_id': 'agent-1', 'agent_type': 'Explore'})
+        self.assertEqual(c.active_agents(SID), ['agent-1'])
+        c.atomic_json(c.session_dir(SID) / 'request.json',
+                      {'state': 'queued', 'created': time.time()})
+        with patch.object(c.subprocess, 'Popen') as popen:
+            c.hook({'hook_event_name': 'Stop', 'session_id': SID, 'background_tasks': []})
+            popen.assert_not_called()
+        c.hook({'hook_event_name': 'SubagentStop', 'session_id': SID,
+                'agent_id': 'agent-1', 'agent_type': 'Explore'})
+        self.assertEqual(c.active_agents(SID), [])
+
+    def test_owner_prompt_cancels_pending_request(self):
+        self.start()
+        c.atomic_json(c.session_dir(SID) / 'request.json',
+                      {'state': 'queued', 'created': time.time()})
+        c.hook({'hook_event_name': 'UserPromptSubmit', 'session_id': SID,
+                'transcript_path': '/missing/transcript'})
+        self.assertEqual(c.read_json(c.session_dir(SID) / 'request.json')['state'], 'cancelled')
+
+    def test_owner_prompt_cancels_pending_resume(self):
+        self.start()
+        c.atomic_json(c.session_dir(SID) / 'request.json',
+                      {'state': 'confirmed', 'resume_state': 'pending'})
+        c.hook({'hook_event_name': 'UserPromptSubmit', 'session_id': SID,
+                'transcript_path': '/missing/transcript'})
+        self.assertEqual(c.read_json(c.session_dir(SID) / 'request.json')['resume_state'], 'cancelled')
+
+    def test_postcompact_starts_optional_resume_and_ignores_auto(self):
+        self.start()
+        Path(os.environ['ORCH_COMPACT_CONFIG']).write_text(
+            json.dumps({'resumeAfterCompaction': True}))
+        c.atomic_json(c.session_dir(SID) / 'request.json',
+                      {'state': 'sent', 'created': time.time(), 'handoff': '/tmp/handoff'})
+        with patch.object(c.subprocess, 'Popen') as popen:
+            c.hook({'hook_event_name': 'PostCompact', 'session_id': SID, 'trigger': 'auto'})
+            popen.assert_not_called()
+            self.assertEqual(c.read_json(c.session_dir(SID) / 'request.json')['state'], 'sent')
+            c.hook({'hook_event_name': 'PostCompact', 'session_id': SID, 'trigger': 'manual'})
+            popen.assert_called_once()
+        req = c.read_json(c.session_dir(SID) / 'request.json')
+        self.assertEqual((req['state'], req['resume_state']), ('confirmed', 'pending'))
+
+    def test_resume_targets_same_pane_with_handoff(self):
+        self.start()
+        c.atomic_json(c.session_dir(SID) / 'request.json',
+                      {'state': 'confirmed', 'resume_state': 'pending', 'handoff': '/tmp/handoff'})
+        calls = []
+        def fake_tmux(*args):
+            calls.append(args)
+            return '❯\u00a0\n───\n  ⏵ auto mode on' if args[0] == 'capture-pane' else ''
+        with patch.object(c, 'tmux', side_effect=fake_tmux), patch.object(c.time, 'sleep'):
+            self.assertEqual(c.resume(SID), 0)
+        sends = [call for call in calls if call[0] == 'send-keys']
+        self.assertEqual(sends[0][2], '%12')
+        self.assertIn('/tmp/handoff', sends[0][4])
+        self.assertEqual(c.read_json(c.session_dir(SID) / 'request.json')['resume_state'], 'sent')
 
     def test_prompt_detection_matches_current_claude_ui(self):
         self.assertTrue(c.idle_prompt_visible("header\n❯\u00a0Try \"how does this work?\"\n───\n  ⏵ auto mode on"))
@@ -127,6 +189,12 @@ class CoordinatorTests(unittest.TestCase):
         Path(os.environ['ORCH_COMPACT_CONFIG']).write_text(
             json.dumps({'softThresholdTokens':400000, 'preferredCompactionTokens':300000}))
         with self.assertRaises(ValueError): c.config()
+        Path(os.environ['ORCH_COMPACT_CONFIG']).write_text(
+            json.dumps({'preserveHandoff': False}))
+        with self.assertRaises(ValueError): c.config()
+        Path(os.environ['ORCH_COMPACT_CONFIG']).write_text(
+            json.dumps({'resumeAfterCompaction': 'false'}))
+        with self.assertRaises(ValueError): c.config()
 
     def test_independent_session_paths(self):
         self.assertNotEqual(c.session_dir(SID), c.session_dir('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'))
@@ -134,11 +202,28 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_postcompact_confirms_without_summary_logging(self):
         self.start()
+        Path(os.environ['ORCH_COMPACT_CONFIG']).write_text(
+            json.dumps({'resumeAfterCompaction': False}))
         c.atomic_json(c.session_dir(SID) / 'request.json', {'state':'sent', 'created':0})
         c.hook({'hook_event_name':'PostCompact', 'session_id':SID, 'trigger':'manual',
                 'compact_summary':'private conversation content'})
         self.assertEqual(c.read_json(c.session_dir(SID) / 'request.json')['state'], 'confirmed')
         self.assertNotIn('private conversation content', (c.session_dir(SID) / 'events.jsonl').read_text())
+
+    def test_after_usage_requires_postcompact_response(self):
+        self.start()
+        d = c.session_dir(SID)
+        c.atomic_json(d / 'request.json', {'state': 'confirmed', 'confirmed_at': time.time()})
+        transcript = Path(self.tmp.name) / 'conversation.jsonl'
+        def sample(timestamp):
+            transcript.write_text(json.dumps({'type': 'assistant', 'timestamp': timestamp,
+                'message': {'usage': {'input_tokens': 5, 'output_tokens': 1}}}) + '\n')
+            c.hook({'hook_event_name': 'PostToolUse', 'session_id': SID,
+                    'transcript_path': str(transcript)})
+        sample('2000-01-01T00:00:00Z')
+        self.assertNotIn('after', c.read_json(d / 'request.json'))
+        sample('2030-01-01T00:00:00Z')
+        self.assertEqual(c.read_json(d / 'request.json')['after'], 5)
 
 
 if __name__ == '__main__': unittest.main()
