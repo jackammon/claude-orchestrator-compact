@@ -12,7 +12,15 @@ if [ "$#" -ne 0 ]; then
   echo 'Launch arguments are not supported by this wrapper; run claude directly inside tmux for custom flags.' >&2
   exit 2
 fi
-plugin_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+script=$0
+while [ -L "$script" ]; do
+  link=$(readlink "$script")
+  case "$link" in
+    /*) script=$link ;;
+    *) script="$(dirname -- "$script")/$link" ;;
+  esac
+done
+plugin_dir=$(CDPATH= cd -- "$(dirname -- "$script")/.." && pwd)
 if [ -n "${TMUX:-}" ]; then
   exec claude --plugin-dir "$plugin_dir"
 fi
