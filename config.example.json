@@ -1,0 +1,11 @@
+{
+  "enabled": true,
+  "softThresholdTokens": 200000,
+  "preferredCompactionTokens": 300000,
+  "escalationThresholdTokens": 400000,
+  "requirePhaseCheckpoint": true,
+  "requireNoActiveSubagents": true,
+  "preserveHandoff": true,
+  "resumeAfterCompaction": false,
+  "telemetryEnabled": true
+}
