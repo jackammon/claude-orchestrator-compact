@@ -81,6 +81,10 @@ class CoordinatorTests(unittest.TestCase):
             popen.assert_called_once()
             self.assertEqual(c.read_json(c.session_dir(SID) / 'request.json')['state'], 'stop_seen')
 
+    def test_prompt_detection_matches_current_claude_ui(self):
+        self.assertTrue(c.idle_prompt_visible("header\n❯\u00a0Try \"how does this work?\"\n───\n  ⏵ auto mode on"))
+        self.assertFalse(c.idle_prompt_visible("header\n❯ user typed text\n───\n  ⏵ auto mode on"))
+
     def test_delivery_fails_closed_without_idle_prompt(self):
         self.start()
         c.atomic_json(c.session_dir(SID) / 'request.json', {'state':'stop_seen', 'handoff':'/tmp/handoff'})

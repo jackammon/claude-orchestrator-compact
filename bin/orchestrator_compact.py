@@ -149,7 +149,7 @@ def hook(payload: dict) -> dict | None:
     binding = read_json(d / "binding.json")
     if not binding:
         return None
-    if event in ("UserPromptSubmit", "PostToolUse"):
+    if event in ("UserPromptSubmit", "PostToolUse", "Stop"):
         usage = usage_from_transcript(payload.get("transcript_path", ""))
         if usage:
             n = usage["context_input_tokens"]
@@ -158,8 +158,11 @@ def hook(payload: dict) -> dict | None:
             state = read_json(d / "usage.json", {})
             if state.get("tier") != tier:
                 log(sid, "threshold", tier=tier, **usage)
-            atomic_json(d / "usage.json", {"tier": tier, "time": time.time(), **usage})
-            if tier != "normal" and state.get("tier") != tier:
+            remind = event != "Stop" and tier != "normal" and state.get("reminded_tier") != tier
+            atomic_json(d / "usage.json", {"tier": tier, "time": time.time(),
+                                             "reminded_tier": tier if remind else state.get("reminded_tier"),
+                                             **usage})
+            if remind:
                 return {"hookSpecificOutput": {"hookEventName": event, "additionalContext":
                         f"Main orchestrator context is approximately {n:,} input tokens ({tier}). Consider compaction at a coherent checkpoint after agents finish. You may defer it to preserve the current phase. Save a handoff first."}}
     if event == "Stop":
@@ -228,6 +231,11 @@ def request(args) -> int:
     return 0
 
 
+def idle_prompt_visible(screen: str) -> bool:
+    lines = [line.strip() for line in screen.splitlines() if line.strip()]
+    return any(re.match(r"^❯(?:\s*$|\s+Try\s)", line) for line in lines[-4:])
+
+
 def deliver(sid: str) -> int:
     """Conservative terminal delivery. Any ambiguous screen or identity aborts."""
     d = session_dir(sid)
@@ -242,8 +250,7 @@ def deliver(sid: str) -> int:
         # Require a stable, empty Claude prompt twice. This is a best-effort UI check.
         for _ in range(20):
             screen = tmux("capture-pane", "-p", "-t", binding["pane"])
-            lines = [s.strip() for s in screen.splitlines() if s.strip()]
-            if lines and lines[-1] in ("❯", ">"):
+            if idle_prompt_visible(screen):
                 time.sleep(0.8)
                 again = tmux("capture-pane", "-p", "-t", binding["pane"])
                 if again == screen and pane_identity(binding["pane"]) == {k: binding[k] for k in ("pane", "pid", "tty", "command")}:
