@@ -16,7 +16,7 @@ from pathlib import Path
 
 DEFAULTS = {"enabled": True, "reminderThresholdsTokens": [350000, 500000, 600000],
             "requestTtlSeconds": 300, "debounceSeconds": 300,
-            "requireNoActiveSubagents": True,
+            "requireNoBackgroundWork": False,
             "requireOwnerInputClear": True,
             "preserveHandoff": True, "resumeAfterCompaction": True,
             "telemetryEnabled": True}
@@ -44,7 +44,7 @@ def config() -> dict:
     for k in ("requestTtlSeconds", "debounceSeconds"):
         if type(cfg[k]) is not int or cfg[k] < 0:
             raise ValueError(f"invalid {k}")
-    for k in ("enabled", "requireNoActiveSubagents",
+    for k in ("enabled", "requireNoBackgroundWork",
               "requireOwnerInputClear", "preserveHandoff", "resumeAfterCompaction",
               "telemetryEnabled"):
         if type(cfg[k]) is not bool:
@@ -108,21 +108,26 @@ def main_only(payload: dict) -> bool:
 
 def orchestrator_guidance(sid: str, token: str, cfg: dict) -> str:
     command = (f"python3 {Path(__file__).resolve()} request --session {sid} --token {token} "
-               "--handoff ABSOLUTE_PATH --reason SHORT_REASON --agents-reconciled --owner-input-clear")
+               "--handoff ABSOLUTE_PATH --reason SHORT_REASON --owner-input-clear"
+               + (" --agents-reconciled" if cfg["requireNoBackgroundWork"] else ""))
     return (
         "Main orchestrator only. Compaction is your decision at any coherent phase checkpoint. "
         f"At approximately {', '.join(f'{t:,}' for t in cfg['reminderThresholdsTokens'])} input tokens, "
         "a one-time reminder will ask you to consider it. Each is advisory, never a mandatory token cutoff; you may defer until a good "
         "stopping place. Consider whether compaction would discard useful working "
         "context, harm answer quality, or increase rather than reduce cost. "
-        "Before requesting, finish and reconcile all child work, ensure no owner feedback, review, or approval "
+        + ("Before requesting, finish and reconcile all child work. " if cfg["requireNoBackgroundWork"] else
+           "Background tasks and subagents may keep running through compaction; their completion notices "
+           "still arrive afterwards. List each one still running in the handoff: its id, what it is doing, and "
+           "what to do with its result. ")
+        + "Before requesting, ensure no owner feedback, review, or approval "
         "is pending, and save a concise durable handoff in the project's existing planning location: current "
         "phase and goal, completed and remaining work, agent findings, branch/PR/CI state, decisions, blockers, "
         "and concrete next actions. Do not create a redundant large document. "
         f"Signal by running `{command}` through Bash; do not print `/compact` yourself. "
-        "Use --agents-reconciled and --owner-input-clear only when those assertions are true. "
+        "Pass --owner-input-clear (and --agents-reconciled, when shown) only when the assertion is true. "
         "You may request compaction before or after the reminder. Then finish your turn. "
-        "The coordinator checks the empty background-task registry at main Stop, enters `/compact` in this "
+        "At main Stop the coordinator enters `/compact` in this "
         "session's tmux pane, and resumes from the handoff after confirmation. Never request this from a subagent."
     )
 
@@ -132,6 +137,24 @@ def threshold_reminder(n: int) -> str:
             "Consider the earliest safe checkpoint; you may defer until a good stopping place. "
             "Reconcile agents, clear pending owner decisions, and save a concise handoff before "
             "signaling with the session-specific request command. You may defer to preserve useful context.")
+
+
+def background_summary(tasks) -> list[str]:
+    """Short one-line labels for the background tasks in a Stop payload, for the resume prompt."""
+    if not isinstance(tasks, list):
+        return []
+    labels = []
+    for t in tasks[:20]:
+        if not isinstance(t, dict):
+            continue
+        parts = [str(t.get(k)) for k in ("id", "task_id", "type", "task_type") if t.get(k)]
+        desc = t.get("description") or t.get("summary")
+        if desc:
+            parts.append(str(desc))
+        label = re.sub(r"[\x00-\x1f]+", " ", " ".join(parts))[:120]
+        if label:
+            labels.append(label)
+    return labels
 
 
 def active_agents(sid: str, event: str | None = None, agent_id: str | None = None) -> list[str]:
@@ -278,12 +301,16 @@ def hook(payload: dict) -> dict | None:
         req = read_json(d / "request.json")
         if not req or req.get("state") != "queued":
             return None
-        if not isinstance(payload.get("background_tasks"), list) or payload["background_tasks"]:
-            log(sid, "deferred", reason="background_tasks")
-            return None
-        if active_agents(sid):
-            log(sid, "deferred", reason="active_subagents")
-            return None
+        tasks = payload.get("background_tasks")
+        if cfg["requireNoBackgroundWork"]:
+            if not isinstance(tasks, list) or tasks:
+                log(sid, "deferred", reason="background_tasks", count=len(tasks) if isinstance(tasks, list) else None)
+                return None
+            if active_agents(sid):
+                log(sid, "deferred", reason="active_subagents")
+                return None
+        else:
+            req["background_at_stop"] = background_summary(tasks)
         if time.time() - req.get("created", 0) > config()["requestTtlSeconds"]:
             req["state"] = "expired"
             atomic_json(d / "request.json", req)
@@ -326,7 +353,7 @@ def request(args) -> int:
         raise ValueError("unbound session")
     if os.environ.get("TMUX_PANE") != binding["pane"]:
         raise ValueError("wrong pane")
-    if cfg["requireNoActiveSubagents"] and not args.agents_reconciled:
+    if cfg["requireNoBackgroundWork"] and not args.agents_reconciled:
         raise ValueError("agent reconciliation required")
     if cfg["requireOwnerInputClear"] and not args.owner_input_clear:
         raise ValueError("owner input or approval clearance required")
@@ -406,9 +433,13 @@ def resume(sid: str) -> int:
         current = read_json(d / "request.json", {})
         if current.get("state") != "confirmed" or current.get("resume_state") != "pending":
             raise ValueError("resume changed")
-        if active_agents(sid):
+        if config()["requireNoBackgroundWork"] and active_agents(sid):
             raise ValueError("active subagents")
         prompt = f"Read the durable handoff at {req['handoff']} and continue the next phase. First confirm the current repository status."
+        running = req.get("background_at_stop")
+        if running:
+            prompt += (" Background work was still running at compaction and will report back when it finishes: "
+                       + "; ".join(running) + ". Keep it going; do not restart it.")
         req["resume_state"] = "sent"
         atomic_json(d / "request.json", req)
         tmux("send-keys", "-t", binding["pane"], "-l", prompt)

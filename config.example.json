@@ -1,7 +1,7 @@
 {
   "enabled": true,
   "reminderThresholdsTokens": [350000, 500000, 600000],
-  "requireNoActiveSubagents": true,
+  "requireNoBackgroundWork": false,
   "requireOwnerInputClear": true,
   "preserveHandoff": true,
   "resumeAfterCompaction": true,

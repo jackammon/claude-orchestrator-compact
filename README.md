@@ -44,9 +44,9 @@ Reminders fire at **350K, 500K and 600K input tokens** (configurable with `remin
 
 At a checkpoint:
 
-1. Finish and reconcile the current batch of subagents. The main `Stop` hook also requires Claude Code's `background_tasks` array to be present and empty.
+1. Background tasks and subagents may keep running: Claude Code keeps them going through `/compact`, and their completion notices still arrive afterwards. List each one still running in the handoff (id, what it is doing, what to do with its result). The `Stop` hook also records the `background_tasks` it sees and the continuation prompt names them. Set `requireNoBackgroundWork` to `true` to restore the old behaviour of waiting until all child work has finished.
 2. Save a concise durable handoff in the project's existing planning location. Record what is done, outstanding work, agent results, branch/PR/CI state, decisions, blockers, and next actions. Keep it under 32 KiB.
-3. Use the session-specific command injected by `SessionStart` to queue the request, supplying the handoff path, a short reason, `--agents-reconciled`, and `--owner-input-clear`. Assert the last flag only when no owner answer, review, or approval is pending. No token minimum or `--force` flag applies.
+3. Use the session-specific command injected by `SessionStart` to queue the request, supplying the handoff path, a short reason, `--owner-input-clear` (plus `--agents-reconciled` when `requireNoBackgroundWork` is on). Assert the last flag only when no owner answer, review, or approval is pending. No token minimum or `--force` flag applies.
 4. Allow the main agent to finish its turn. The `Stop` hook queues delivery; the worker checks that the exact bound tmux pane still exists and shows a stable empty prompt.
 5. `PostCompact` confirms the manual compaction. With `resumeAfterCompaction` enabled, a second worker waits for the same pane to show a stable empty prompt, then asks Claude to read the handoff, check repository status, and continue. This path passed a disposable Haiku 5.5 test.
 
@@ -69,7 +69,7 @@ Set `enabled` to `false` in the config and restart Claude Code, or uninstall/dis
 ## Troubleshooting and limitations
 
 - No reminder: confirm the plugin loaded, the session is the main agent, and the transcript has usage data. Hooks skip agents with `agent_id` or `agent_type`.
-- Queued but not sent: check `background_tasks`, request expiry, pane identity, and the exact empty prompt in `events.jsonl`. The worker fails closed on ambiguity.
+- Queued but not sent: check `background_tasks` (only with `requireNoBackgroundWork`), request expiry, pane identity, and the exact empty prompt in `events.jsonl`. The worker fails closed on ambiguity.
 - Sent but not confirmed: check whether `/compact` ran and whether `PostCompact` fired. Do not assume a successful `tmux send-keys` means compaction succeeded.
 - Owner feedback is pending: do not queue compaction. If you type a new prompt before delivery, the hook cancels the request. To cancel explicitly, run `python3 bin/orchestrator_compact.py cancel --session UUID`.
 - You can always attach with `tmux attach -t SESSION_NAME`, type to Claude normally, and detach with `Ctrl-b d`. Keep the main orchestrator in its own pane; child agents do not receive terminal input from this plugin.

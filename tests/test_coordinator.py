@@ -157,7 +157,8 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(c.request(a), 0)
         with self.assertRaises(ValueError): c.request(a)
 
-    def test_stop_requires_empty_task_registry(self):
+    def test_strict_mode_stop_requires_empty_task_registry(self):
+        Path(os.environ['ORCH_COMPACT_CONFIG']).write_text(json.dumps({'requireNoBackgroundWork': True}))
         b = self.start()
         handoff = Path(self.tmp.name) / 'handoff.md'
         handoff.write_text('state')
@@ -174,7 +175,8 @@ class CoordinatorTests(unittest.TestCase):
             popen.assert_called_once()
             self.assertEqual(c.read_json(c.session_dir(SID) / 'request.json')['state'], 'stop_seen')
 
-    def test_child_lifecycle_blocks_main_compaction(self):
+    def test_strict_mode_child_lifecycle_blocks_main_compaction(self):
+        Path(os.environ['ORCH_COMPACT_CONFIG']).write_text(json.dumps({'requireNoBackgroundWork': True}))
         self.start()
         c.hook({'hook_event_name': 'SubagentStart', 'session_id': SID,
                 'agent_id': 'agent-1', 'agent_type': 'Explore'})
@@ -187,6 +189,31 @@ class CoordinatorTests(unittest.TestCase):
         c.hook({'hook_event_name': 'SubagentStop', 'session_id': SID,
                 'agent_id': 'agent-1', 'agent_type': 'Explore'})
         self.assertEqual(c.active_agents(SID), [])
+
+    def test_default_compacts_through_background_work_and_lists_it_on_resume(self):
+        b = self.start()
+        handoff = Path(self.tmp.name) / 'handoff.md'
+        handoff.write_text('state')
+        class Args: pass
+        a = Args()
+        a.session, a.token, a.handoff, a.reason = SID, b['token'], str(handoff), 'phase done'
+        a.agents_reconciled, a.owner_input_clear = False, True
+        self.assertEqual(c.request(a), 0)
+        c.hook({'hook_event_name': 'SubagentStart', 'session_id': SID, 'agent_id': 'agent-1', 'agent_type': 'Explore'})
+        with patch.object(c.subprocess, 'Popen') as popen:
+            c.hook({'hook_event_name': 'Stop', 'session_id': SID, 'background_tasks': [
+                {'id': 'b939yc4um', 'type': 'local_bash', 'description': 'Wait for CI\non #266'}]})
+            popen.assert_called_once()
+        req = c.read_json(c.session_dir(SID) / 'request.json')
+        self.assertEqual(req['state'], 'stop_seen')
+        self.assertEqual(req['background_at_stop'], ['b939yc4um local_bash Wait for CI on #266'])
+        req.update(state='confirmed', resume_state='pending')
+        c.atomic_json(c.session_dir(SID) / 'request.json', req)
+        with patch.object(c, 'wait_for_idle_pane'), patch.object(c, 'tmux') as tmux, patch.object(c.time, 'sleep'):
+            self.assertEqual(c.resume(SID), 0)
+        prompt = tmux.call_args_list[0].args[-1]
+        self.assertIn('b939yc4um local_bash Wait for CI on #266', prompt)
+        self.assertIn('do not restart it', prompt)
 
     def test_owner_prompt_cancels_pending_request(self):
         self.start()
