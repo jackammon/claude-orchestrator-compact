@@ -19,7 +19,7 @@ flowchart LR
   I --> J[PostCompact confirms and queues continuation]
 ```
 
-The plugin hooks run in subagents too, because Claude Code applies plugin hooks there. Every hook checks `agent_id` and `agent_type` and returns without side effects for child agents. A request can only be delivered from the bound **main** session's `Stop` hook. `SubagentStart` and `SubagentStop` track active children; the main `Stop` also requires an empty background task registry. Native subagent auto-compaction remains Claude Code's responsibility.
+The plugin hooks run in subagents too, because Claude Code applies plugin hooks there. Every hook checks `agent_id` and `agent_type` and returns without side effects for child agents. A request can only be delivered from the bound **main** session's `Stop` hook. `SubagentStart` and `SubagentStop` track active children; with `requireNoBackgroundWork`, the main `Stop` also requires them and the background task registry to be empty. Native subagent auto-compaction remains Claude Code's responsibility.
 
 ## Requirements
 
