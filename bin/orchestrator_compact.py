@@ -14,7 +14,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-DEFAULTS = {"enabled": True, "reminderThresholdTokens": 600000,
+DEFAULTS = {"enabled": True, "reminderThresholdsTokens": [350000, 500000, 600000],
             "requestTtlSeconds": 300, "debounceSeconds": 300,
             "requireNoActiveSubagents": True,
             "requireOwnerInputClear": True,
@@ -36,8 +36,11 @@ def config() -> dict:
         if not isinstance(data, dict) or set(data) - set(cfg):
             raise ValueError("invalid configuration keys")
         cfg.update(data)
-    if type(cfg["reminderThresholdTokens"]) is not int or cfg["reminderThresholdTokens"] < 0:
-        raise ValueError("invalid reminderThresholdTokens")
+    thresholds = cfg["reminderThresholdsTokens"]
+    if (not isinstance(thresholds, list) or not thresholds or
+            any(type(t) is not int or t < 0 for t in thresholds) or len(set(thresholds)) != len(thresholds)):
+        raise ValueError("invalid reminderThresholdsTokens")
+    cfg["reminderThresholdsTokens"] = sorted(thresholds)
     for k in ("requestTtlSeconds", "debounceSeconds"):
         if type(cfg[k]) is not int or cfg[k] < 0:
             raise ValueError(f"invalid {k}")
@@ -108,8 +111,8 @@ def orchestrator_guidance(sid: str, token: str, cfg: dict) -> str:
                "--handoff ABSOLUTE_PATH --reason SHORT_REASON --agents-reconciled --owner-input-clear")
     return (
         "Main orchestrator only. Compaction is your decision at any coherent phase checkpoint. "
-        f"At approximately {cfg['reminderThresholdTokens']:,} input tokens, a one-time reminder will ask "
-        "you to consider it. This is advisory, never a mandatory token cutoff; you may defer until a good "
+        f"At approximately {', '.join(f'{t:,}' for t in cfg['reminderThresholdsTokens'])} input tokens, "
+        "a one-time reminder will ask you to consider it. Each is advisory, never a mandatory token cutoff; you may defer until a good "
         "stopping place. Consider whether compaction would discard useful working "
         "context, harm answer quality, or increase rather than reduce cost. "
         "Before requesting, finish and reconcile all child work, ensure no owner feedback, review, or approval "
@@ -208,10 +211,21 @@ def hook(payload: dict) -> dict | None:
             return None
         if ident["command"] != "claude":
             return None
-        token = secrets.token_hex(24)
-        atomic_json(d / "binding.json", {**ident, "session_id": sid, "token": token,
-                                           "cwd": payload.get("cwd"), "created": time.time()})
-        log(sid, "session_start", pane=pane)
+        source = payload.get("source")
+        existing = read_json(d / "binding.json")
+        same_pane = bool(existing) and all(existing.get(k) == ident[k] for k in ("pane", "pid", "tty", "command"))
+        # Worktree-isolated agents fire SessionStart with the main session_id, the main pane and
+        # no agent_id. A fresh main start always has a new session_id, so a startup that finds
+        # this pane already bound is a child: rotating the token would strand the main session.
+        if same_pane and source == "startup":
+            log(sid, "session_start_ignored", pane=pane, source=source, cwd=payload.get("cwd"))
+            return None
+        # Resume, clear and compact keep the token so earlier guidance stays valid.
+        token = existing["token"] if same_pane else secrets.token_hex(24)
+        if not same_pane:
+            atomic_json(d / "binding.json", {**ident, "session_id": sid, "token": token,
+                                               "cwd": payload.get("cwd"), "created": time.time()})
+        log(sid, "session_start", pane=pane, source=source, rebound=not same_pane)
         return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext":
                 orchestrator_guidance(sid, token, cfg)}}
     binding = read_json(d / "binding.json")
@@ -232,15 +246,20 @@ def hook(payload: dict) -> dict | None:
         if usage:
             n = usage["context_input_tokens"]
             state = read_json(d / "usage.json", {})
-            above = n >= cfg["reminderThresholdTokens"]
-            if above and not state.get("above_reminder"):
-                log(sid, "reminder_threshold", **usage)
-            remind = (event != "Stop" and above and
-                      not state.get("reminded_above_threshold", False))
-            atomic_json(d / "usage.json", {"above_reminder": above, "time": time.time(),
-                                             "reminded_above_threshold":
-                                                 above and (remind or state.get("reminded_above_threshold", False)),
-                                             **usage})
+            crossed = [t for t in cfg["reminderThresholdsTokens"] if n >= t]
+            # A threshold rearms once context falls back below it, e.g. after compaction.
+            reminded = [t for t in state.get("reminded_thresholds", []) if t in crossed]
+            due = [t for t in crossed if t not in reminded]
+            for t in due:
+                if t not in state.get("crossed_thresholds", []):
+                    log(sid, "reminder_threshold", threshold=t, **usage)
+            # Stop never reminds, so a threshold first seen at Stop reminds on the next tool use.
+            remind = event != "Stop" and bool(due)
+            if remind:
+                reminded = crossed
+            atomic_json(d / "usage.json", {"above_reminder": bool(crossed), "time": time.time(),
+                                             "crossed_thresholds": crossed,
+                                             "reminded_thresholds": reminded, **usage})
             req = read_json(d / "request.json")
             if req and req.get("state") == "confirmed" and "after" not in req:
                 try:

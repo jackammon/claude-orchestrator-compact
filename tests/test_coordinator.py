@@ -36,7 +36,7 @@ class CoordinatorTests(unittest.TestCase):
     def test_main_guidance_keeps_compaction_discretionary(self):
         result = c.hook({'hook_event_name': 'SessionStart', 'session_id': SID, 'cwd': self.tmp.name})
         guidance = result['hookSpecificOutput']['additionalContext']
-        for phrase in ('Compaction is your decision', '600,000',
+        for phrase in ('Compaction is your decision', '350,000, 500,000, 600,000',
                        'at any coherent phase checkpoint', 'good stopping place',
                        'owner feedback, review, or approval', 'branch/PR/CI state',
                        'through Bash; do not print `/compact` yourself'):
@@ -46,11 +46,27 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_custom_reminder_threshold_is_reflected_in_guidance(self):
         Path(os.environ['ORCH_COMPACT_CONFIG']).write_text(json.dumps({
-            'reminderThresholdTokens': 3000}))
+            'reminderThresholdsTokens': [3000]}))
         result = c.hook({'hook_event_name': 'SessionStart', 'session_id': SID})
         guidance = result['hookSpecificOutput']['additionalContext']
         self.assertIn('3,000', guidance)
         self.assertNotIn('600,000', guidance)
+
+    def test_repeat_session_start_keeps_the_main_token(self):
+        token = self.start()['token']
+        child = c.hook({'hook_event_name': 'SessionStart', 'session_id': SID, 'source': 'startup',
+                        'cwd': '/repo/.claude/worktrees/agent-1'})
+        self.assertIsNone(child)
+        self.assertEqual(c.read_json(c.session_dir(SID) / 'binding.json')['token'], token)
+        result = c.hook({'hook_event_name': 'SessionStart', 'session_id': SID, 'source': 'compact'})
+        self.assertIn(token, result['hookSpecificOutput']['additionalContext'])
+        self.assertEqual(c.read_json(c.session_dir(SID) / 'binding.json')['token'], token)
+
+    def test_session_start_in_a_new_pane_rebinds(self):
+        token = self.start()['token']
+        self.identity['pid'] = '456'
+        c.hook({'hook_event_name': 'SessionStart', 'session_id': SID, 'source': 'resume'})
+        self.assertNotEqual(c.read_json(c.session_dir(SID) / 'binding.json')['token'], token)
 
     def test_subagent_cannot_register_or_emit_reminder(self):
         self.assertIsNone(c.hook({'hook_event_name': 'SessionStart', 'session_id': SID, 'agent_id': 'agent-1'}))
@@ -62,8 +78,7 @@ class CoordinatorTests(unittest.TestCase):
     def test_only_reminder_threshold_uses_input_cache_counts(self):
         self.start()
         t = Path(self.tmp.name) / 't.jsonl'
-        for n, above in [(199999, False), (200000, False), (500000, False),
-                         (599999, False), (600000, True)]:
+        for n, above in [(199999, False), (349999, False), (350000, True)]:
             t.write_text(json.dumps({'type': 'assistant', 'message': {'usage': {
                 'input_tokens': 1, 'cache_read_input_tokens': n - 1,
                 'cache_creation_input_tokens': 0, 'output_tokens': 900}}}) + '\n')
@@ -92,6 +107,39 @@ class CoordinatorTests(unittest.TestCase):
         self.assertIsNotNone(observe(600000))
         self.assertIsNone(observe(610000))
         self.assertIsNone(observe(500000))
+        self.assertIsNotNone(observe(600000))
+
+    def test_each_threshold_reminds_once_in_order(self):
+        self.start()
+        t = Path(self.tmp.name) / 't.jsonl'
+        def observe(n):
+            t.write_text(json.dumps({'type': 'assistant', 'message': {'usage': {
+                'input_tokens': n, 'cache_read_input_tokens': 0,
+                'cache_creation_input_tokens': 0, 'output_tokens': 1}}}) + '\n')
+            return c.hook({'hook_event_name': 'PostToolUse', 'session_id': SID,
+                           'transcript_path': str(t)})
+        self.assertIsNone(observe(349999))
+        self.assertIsNotNone(observe(350000))
+        self.assertIsNone(observe(420000))
+        self.assertIsNotNone(observe(500000))
+        self.assertIsNone(observe(550000))
+        self.assertIsNotNone(observe(600000))
+        self.assertIsNone(observe(650000))
+        # After compaction, context drops and every threshold rearms.
+        self.assertIsNone(observe(100000))
+        self.assertIsNotNone(observe(360000))
+
+    def test_jumping_past_several_thresholds_reminds_once(self):
+        self.start()
+        t = Path(self.tmp.name) / 't.jsonl'
+        def observe(n):
+            t.write_text(json.dumps({'type': 'assistant', 'message': {'usage': {
+                'input_tokens': n, 'cache_read_input_tokens': 0,
+                'cache_creation_input_tokens': 0, 'output_tokens': 1}}}) + '\n')
+            return c.hook({'hook_event_name': 'PostToolUse', 'session_id': SID,
+                           'transcript_path': str(t)})
+        self.assertIsNotNone(observe(520000))
+        self.assertIsNone(observe(530000))
         self.assertIsNotNone(observe(600000))
 
     def test_request_gates_and_duplicate(self):
@@ -229,7 +277,14 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_invalid_config_fails_closed(self):
         Path(os.environ['ORCH_COMPACT_CONFIG']).write_text(
-            json.dumps({'reminderThresholdTokens': -1}))
+            json.dumps({'reminderThresholdsTokens': [-1]}))
+        with self.assertRaises(ValueError): c.config()
+        for bad in ([], 600000, [350000, 350000], [True]):
+            Path(os.environ['ORCH_COMPACT_CONFIG']).write_text(
+                json.dumps({'reminderThresholdsTokens': bad}))
+            with self.assertRaises(ValueError): c.config()
+        Path(os.environ['ORCH_COMPACT_CONFIG']).write_text(
+            json.dumps({'reminderThresholdTokens': 600000}))
         with self.assertRaises(ValueError): c.config()
         Path(os.environ['ORCH_COMPACT_CONFIG']).write_text(
             json.dumps({'softThresholdTokens': 200000}))

@@ -38,7 +38,7 @@ The plugin does not edit `~/.claude/settings.json`, shell startup files, or agen
 
 ## Checkpoint policy
 
-The only threshold is a **600K input-token reminder** based on the latest main conversation API response, including cache-read and cache-write tokens. The main orchestrator can request compaction at any earlier or later coherent checkpoint. At 600K, the hook reminds it once to consider compaction; it may defer until a good stopping place. The reminder can rearm after context falls below 600K and later crosses it again. Native safety auto-compaction remains unchanged.
+Reminders fire at **350K, 500K and 600K input tokens** (configurable with `reminderThresholdsTokens`), based on the latest main conversation API response, including cache-read and cache-write tokens. The main orchestrator can request compaction at any earlier or later coherent checkpoint. Each threshold reminds once and may be deferred until a good stopping place; if context jumps past several at once, one reminder covers them. A threshold rearms after context falls back below it, for example after compaction. Native safety auto-compaction remains unchanged.
 
 `SessionStart` gives the **main orchestrator** that policy, the handoff checklist, and a session-specific request command. The orchestrator signals by running the local `request` command through its Bash tool; it does not print `/compact` or attempt to run that slash command itself. The request records its decision, and the coordinator handles `/compact` after the main turn ends. Child agents receive no such instruction.
 

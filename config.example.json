@@ -1,6 +1,6 @@
 {
   "enabled": true,
-  "reminderThresholdTokens": 600000,
+  "reminderThresholdsTokens": [350000, 500000, 600000],
   "requireNoActiveSubagents": true,
   "requireOwnerInputClear": true,
   "preserveHandoff": true,
