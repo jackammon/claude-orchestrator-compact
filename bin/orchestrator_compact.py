@@ -14,9 +14,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-DEFAULTS = {"enabled": True, "reminderThresholdTokens": 600000,
+DEFAULTS = {"enabled": True, "reminderThresholdsTokens": [350000, 500000, 600000],
             "requestTtlSeconds": 300, "debounceSeconds": 300,
-            "requireNoActiveSubagents": True,
+            "requireNoBackgroundWork": False,
             "requireOwnerInputClear": True,
             "preserveHandoff": True, "resumeAfterCompaction": True,
             "telemetryEnabled": True}
@@ -36,12 +36,15 @@ def config() -> dict:
         if not isinstance(data, dict) or set(data) - set(cfg):
             raise ValueError("invalid configuration keys")
         cfg.update(data)
-    if type(cfg["reminderThresholdTokens"]) is not int or cfg["reminderThresholdTokens"] < 0:
-        raise ValueError("invalid reminderThresholdTokens")
+    thresholds = cfg["reminderThresholdsTokens"]
+    if (not isinstance(thresholds, list) or not thresholds or
+            any(type(t) is not int or t < 0 for t in thresholds) or len(set(thresholds)) != len(thresholds)):
+        raise ValueError("invalid reminderThresholdsTokens")
+    cfg["reminderThresholdsTokens"] = sorted(thresholds)
     for k in ("requestTtlSeconds", "debounceSeconds"):
         if type(cfg[k]) is not int or cfg[k] < 0:
             raise ValueError(f"invalid {k}")
-    for k in ("enabled", "requireNoActiveSubagents",
+    for k in ("enabled", "requireNoBackgroundWork",
               "requireOwnerInputClear", "preserveHandoff", "resumeAfterCompaction",
               "telemetryEnabled"):
         if type(cfg[k]) is not bool:
@@ -105,21 +108,26 @@ def main_only(payload: dict) -> bool:
 
 def orchestrator_guidance(sid: str, token: str, cfg: dict) -> str:
     command = (f"python3 {Path(__file__).resolve()} request --session {sid} --token {token} "
-               "--handoff ABSOLUTE_PATH --reason SHORT_REASON --agents-reconciled --owner-input-clear")
+               "--handoff ABSOLUTE_PATH --reason SHORT_REASON --owner-input-clear"
+               + (" --agents-reconciled" if cfg["requireNoBackgroundWork"] else ""))
     return (
         "Main orchestrator only. Compaction is your decision at any coherent phase checkpoint. "
-        f"At approximately {cfg['reminderThresholdTokens']:,} input tokens, a one-time reminder will ask "
-        "you to consider it. This is advisory, never a mandatory token cutoff; you may defer until a good "
+        f"At approximately {', '.join(f'{t:,}' for t in cfg['reminderThresholdsTokens'])} input tokens, "
+        "a one-time reminder will ask you to consider it. Each is advisory, never a mandatory token cutoff; you may defer until a good "
         "stopping place. Consider whether compaction would discard useful working "
         "context, harm answer quality, or increase rather than reduce cost. "
-        "Before requesting, finish and reconcile all child work, ensure no owner feedback, review, or approval "
+        + ("Before requesting, finish and reconcile all child work. " if cfg["requireNoBackgroundWork"] else
+           "Background tasks and subagents may keep running through compaction; their completion notices "
+           "still arrive afterwards. List each one still running in the handoff: its id, what it is doing, and "
+           "what to do with its result. ")
+        + "Before requesting, ensure no owner feedback, review, or approval "
         "is pending, and save a concise durable handoff in the project's existing planning location: current "
         "phase and goal, completed and remaining work, agent findings, branch/PR/CI state, decisions, blockers, "
         "and concrete next actions. Do not create a redundant large document. "
         f"Signal by running `{command}` through Bash; do not print `/compact` yourself. "
-        "Use --agents-reconciled and --owner-input-clear only when those assertions are true. "
+        "Pass --owner-input-clear (and --agents-reconciled, when shown) only when the assertion is true. "
         "You may request compaction before or after the reminder. Then finish your turn. "
-        "The coordinator checks the empty background-task registry at main Stop, enters `/compact` in this "
+        "At main Stop the coordinator enters `/compact` in this "
         "session's tmux pane, and resumes from the handoff after confirmation. Never request this from a subagent."
     )
 
@@ -129,6 +137,24 @@ def threshold_reminder(n: int) -> str:
             "Consider the earliest safe checkpoint; you may defer until a good stopping place. "
             "Reconcile agents, clear pending owner decisions, and save a concise handoff before "
             "signaling with the session-specific request command. You may defer to preserve useful context.")
+
+
+def background_summary(tasks) -> list[str]:
+    """Short one-line labels for the background tasks in a Stop payload, for the resume prompt."""
+    if not isinstance(tasks, list):
+        return []
+    labels = []
+    for t in tasks[:20]:
+        if not isinstance(t, dict):
+            continue
+        parts = [str(t.get(k)) for k in ("id", "task_id", "type", "task_type") if t.get(k)]
+        desc = t.get("description") or t.get("summary")
+        if desc:
+            parts.append(str(desc))
+        label = re.sub(r"[\x00-\x1f]+", " ", " ".join(parts))[:120]
+        if label:
+            labels.append(label)
+    return labels
 
 
 def active_agents(sid: str, event: str | None = None, agent_id: str | None = None) -> list[str]:
@@ -208,10 +234,21 @@ def hook(payload: dict) -> dict | None:
             return None
         if ident["command"] != "claude":
             return None
-        token = secrets.token_hex(24)
-        atomic_json(d / "binding.json", {**ident, "session_id": sid, "token": token,
-                                           "cwd": payload.get("cwd"), "created": time.time()})
-        log(sid, "session_start", pane=pane)
+        source = payload.get("source")
+        existing = read_json(d / "binding.json")
+        same_pane = bool(existing) and all(existing.get(k) == ident[k] for k in ("pane", "pid", "tty", "command"))
+        # Worktree-isolated agents fire SessionStart with the main session_id, the main pane and
+        # no agent_id. A fresh main start always has a new session_id, so a startup that finds
+        # this pane already bound is a child: rotating the token would strand the main session.
+        if same_pane and source == "startup":
+            log(sid, "session_start_ignored", pane=pane, source=source, cwd=payload.get("cwd"))
+            return None
+        # Resume, clear and compact keep the token so earlier guidance stays valid.
+        token = existing["token"] if same_pane else secrets.token_hex(24)
+        if not same_pane:
+            atomic_json(d / "binding.json", {**ident, "session_id": sid, "token": token,
+                                               "cwd": payload.get("cwd"), "created": time.time()})
+        log(sid, "session_start", pane=pane, source=source, rebound=not same_pane)
         return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext":
                 orchestrator_guidance(sid, token, cfg)}}
     binding = read_json(d / "binding.json")
@@ -232,15 +269,20 @@ def hook(payload: dict) -> dict | None:
         if usage:
             n = usage["context_input_tokens"]
             state = read_json(d / "usage.json", {})
-            above = n >= cfg["reminderThresholdTokens"]
-            if above and not state.get("above_reminder"):
-                log(sid, "reminder_threshold", **usage)
-            remind = (event != "Stop" and above and
-                      not state.get("reminded_above_threshold", False))
-            atomic_json(d / "usage.json", {"above_reminder": above, "time": time.time(),
-                                             "reminded_above_threshold":
-                                                 above and (remind or state.get("reminded_above_threshold", False)),
-                                             **usage})
+            crossed = [t for t in cfg["reminderThresholdsTokens"] if n >= t]
+            # A threshold rearms once context falls back below it, e.g. after compaction.
+            reminded = [t for t in state.get("reminded_thresholds", []) if t in crossed]
+            due = [t for t in crossed if t not in reminded]
+            for t in due:
+                if t not in state.get("crossed_thresholds", []):
+                    log(sid, "reminder_threshold", threshold=t, **usage)
+            # Stop never reminds, so a threshold first seen at Stop reminds on the next tool use.
+            remind = event != "Stop" and bool(due)
+            if remind:
+                reminded = crossed
+            atomic_json(d / "usage.json", {"above_reminder": bool(crossed), "time": time.time(),
+                                             "crossed_thresholds": crossed,
+                                             "reminded_thresholds": reminded, **usage})
             req = read_json(d / "request.json")
             if req and req.get("state") == "confirmed" and "after" not in req:
                 try:
@@ -259,12 +301,16 @@ def hook(payload: dict) -> dict | None:
         req = read_json(d / "request.json")
         if not req or req.get("state") != "queued":
             return None
-        if not isinstance(payload.get("background_tasks"), list) or payload["background_tasks"]:
-            log(sid, "deferred", reason="background_tasks")
-            return None
-        if active_agents(sid):
-            log(sid, "deferred", reason="active_subagents")
-            return None
+        tasks = payload.get("background_tasks")
+        if cfg["requireNoBackgroundWork"]:
+            if not isinstance(tasks, list) or tasks:
+                log(sid, "deferred", reason="background_tasks", count=len(tasks) if isinstance(tasks, list) else None)
+                return None
+            if active_agents(sid):
+                log(sid, "deferred", reason="active_subagents")
+                return None
+        else:
+            req["background_at_stop"] = background_summary(tasks)
         if time.time() - req.get("created", 0) > config()["requestTtlSeconds"]:
             req["state"] = "expired"
             atomic_json(d / "request.json", req)
@@ -307,7 +353,7 @@ def request(args) -> int:
         raise ValueError("unbound session")
     if os.environ.get("TMUX_PANE") != binding["pane"]:
         raise ValueError("wrong pane")
-    if cfg["requireNoActiveSubagents"] and not args.agents_reconciled:
+    if cfg["requireNoBackgroundWork"] and not args.agents_reconciled:
         raise ValueError("agent reconciliation required")
     if cfg["requireOwnerInputClear"] and not args.owner_input_clear:
         raise ValueError("owner input or approval clearance required")
@@ -387,9 +433,13 @@ def resume(sid: str) -> int:
         current = read_json(d / "request.json", {})
         if current.get("state") != "confirmed" or current.get("resume_state") != "pending":
             raise ValueError("resume changed")
-        if active_agents(sid):
+        if config()["requireNoBackgroundWork"] and active_agents(sid):
             raise ValueError("active subagents")
         prompt = f"Read the durable handoff at {req['handoff']} and continue the next phase. First confirm the current repository status."
+        running = req.get("background_at_stop")
+        if running:
+            prompt += (" Background work was still running at compaction and will report back when it finishes: "
+                       + "; ".join(running) + ". Keep it going; do not restart it.")
         req["resume_state"] = "sent"
         atomic_json(d / "request.json", req)
         tmux("send-keys", "-t", binding["pane"], "-l", prompt)
